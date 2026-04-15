@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --color-accent: #f43f5e;
+}
+
+:root {
+  color-scheme: dark;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv11", "ss01", "ss03";
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: #0a0a0c;
+  color: #e7e7ea;
+  margin: 0;
+}

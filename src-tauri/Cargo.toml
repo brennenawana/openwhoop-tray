@@ -1,0 +1,29 @@
+[package]
+name = "openwhoop-tray"
+version = "0.1.0"
+description = "OpenWhoop tray app"
+authors = ["Brennen Awana <brennen@xargz.com>"]
+edition = "2021"
+
+[lib]
+name = "openwhoop_tray_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+
+openwhoop-db = { path = "../vendor/openwhoop/src/openwhoop-db" }
+openwhoop-algos = { path = "../vendor/openwhoop/src/openwhoop-algos" }
+openwhoop-codec = { path = "../vendor/openwhoop/src/openwhoop-codec" }
+openwhoop-entities = { path = "../vendor/openwhoop/src/openwhoop-entities" }
+openwhoop-types = { path = "../vendor/openwhoop/src/openwhoop-types" }
