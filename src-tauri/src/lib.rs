@@ -243,6 +243,50 @@ async fn clear_alarm(app: AppHandle) -> Result<AlarmStatus, String> {
     do_alarm_op(app, AlarmOp::Clear).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn ring_strap(app: AppHandle) -> Result<(), String> {
+    do_ring_strap(app).await.map_err(|e| e.to_string())
+}
+
+/// Connect, fire the strap's haptic alarm, disconnect. No response handling —
+/// this is the "find my strap" buzz-now command, not scheduling.
+async fn do_ring_strap(app: AppHandle) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    if *state.sync_in_progress.read().await {
+        anyhow::bail!("Sync in progress — try again in a moment");
+    }
+    let device_name = state
+        .config
+        .read()
+        .await
+        .device_name
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Device not configured"))?;
+
+    let db_arc = ensure_db_from_handle(&app)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let db: DatabaseHandler = (*db_arc).clone();
+
+    let _ble_guard = state.ble_lock.clone().lock_owned().await;
+
+    let manager = Manager::new().await?;
+    let adapter = manager
+        .adapters()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
+
+    let peripheral = scan_for_device(&adapter, &device_name).await?;
+    let mut device = WhoopDevice::new(peripheral, adapter, db, false);
+    device.connect().await?;
+    device.send_command(WhoopPacket::run_alarm()).await?;
+
+    *state.strap_seen_at.write().await = Some(Local::now().naive_local());
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum AlarmOp {
     Read,
@@ -1226,6 +1270,7 @@ pub fn run() {
             get_alarm,
             set_alarm,
             clear_alarm,
+            ring_strap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

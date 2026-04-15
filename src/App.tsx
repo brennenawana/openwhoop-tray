@@ -469,6 +469,18 @@ function App() {
     }
   };
 
+  const onRingStrap = async () => {
+    setAlarmBusy(true);
+    setError(null);
+    try {
+      await invoke("ring_strap");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setAlarmBusy(false);
+    }
+  };
+
   const onSync = async () => {
     if (!deviceName.trim()) {
       setShowSettings(true);
@@ -694,6 +706,13 @@ function App() {
                 Talking to the strap…
               </p>
             )}
+            <button
+              onClick={onRingStrap}
+              disabled={alarmBusy}
+              className="rounded border border-zinc-800 hover:border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              Buzz strap (find it)
+            </button>
           </div>
         </div>
       )}
