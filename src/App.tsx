@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { DiscoveredDevice, Snapshot } from "./types";
+import type { AlarmStatus, DiscoveredDevice, Snapshot } from "./types";
 import "./App.css";
 
 type SyncStage = "scanning" | "connecting" | "downloading" | "processing" | "done";
@@ -246,6 +246,8 @@ function App() {
   const [scanning, setScanning] = useState<boolean>(false);
   const [scanResults, setScanResults] = useState<DiscoveredDevice[]>([]);
   const [downloadCount, setDownloadCount] = useState<number>(0);
+  const [alarmInput, setAlarmInput] = useState<string>("");
+  const [alarmBusy, setAlarmBusy] = useState<boolean>(false);
   const [tick, setTick] = useState(0);
   // tick increments every 30s so the "Next sync in Xm" label re-renders
   useEffect(() => {
@@ -392,6 +394,67 @@ function App() {
     const t = setTimeout(() => setLastSync(null), 8000);
     return () => clearTimeout(t);
   }, [lastSync]);
+
+  // ---------- Alarm helpers ----------
+
+  const resolveAlarmUnix = (hhmm: string): number | null => {
+    // hhmm is "HH:MM". Returns next-occurrence unix timestamp (seconds).
+    const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+    if (!m) return null;
+    const hours = Number(m[1]);
+    const mins = Number(m[2]);
+    if (hours > 23 || mins > 59) return null;
+    const target = new Date();
+    target.setHours(hours, mins, 0, 0);
+    if (target.getTime() <= Date.now()) {
+      target.setDate(target.getDate() + 1); // next day
+    }
+    return Math.floor(target.getTime() / 1000);
+  };
+
+  const onSetAlarm = async () => {
+    const unix = resolveAlarmUnix(alarmInput);
+    if (unix == null) {
+      setError("Enter a time in HH:MM format");
+      return;
+    }
+    setAlarmBusy(true);
+    setError(null);
+    try {
+      await invoke<AlarmStatus>("set_alarm", { unix });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setAlarmBusy(false);
+    }
+  };
+
+  const onClearAlarm = async () => {
+    setAlarmBusy(true);
+    setError(null);
+    try {
+      await invoke<AlarmStatus>("clear_alarm");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setAlarmBusy(false);
+    }
+  };
+
+  const onRefreshAlarm = async () => {
+    setAlarmBusy(true);
+    setError(null);
+    try {
+      await invoke<AlarmStatus>("get_alarm");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setAlarmBusy(false);
+    }
+  };
 
   const onSync = async () => {
     if (!deviceName.trim()) {
@@ -561,6 +624,61 @@ function App() {
               className="accent-rose-500"
             />
           </label>
+
+          <div className="flex flex-col gap-2 border-t border-zinc-800 pt-3">
+            <div className="flex items-center justify-between">
+              <label className="text-[10px] uppercase tracking-wider text-zinc-500">
+                Strap alarm
+              </label>
+              <button
+                onClick={onRefreshAlarm}
+                disabled={alarmBusy}
+                className="text-[10px] text-zinc-500 hover:text-zinc-300 disabled:opacity-40"
+              >
+                refresh
+              </button>
+            </div>
+            <p className="text-[11px] text-zinc-400 tabular-nums">
+              {snapshot?.alarm?.enabled && snapshot.alarm.at
+                ? `Alarm set for ${formatTime(snapshot.alarm.at)} on ${new Date(
+                    snapshot.alarm.at,
+                  ).toLocaleDateString([], {
+                    weekday: "short",
+                    month: "short",
+                    day: "numeric",
+                  })}`
+                : snapshot?.alarm
+                ? "No alarm currently set"
+                : "Status unknown — click refresh"}
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="time"
+                value={alarmInput}
+                onChange={(e) => setAlarmInput(e.target.value)}
+                className="flex-1 rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600 [color-scheme:dark]"
+              />
+              <button
+                onClick={onSetAlarm}
+                disabled={alarmBusy || !alarmInput}
+                className="rounded border border-zinc-800 hover:border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                Set
+              </button>
+              <button
+                onClick={onClearAlarm}
+                disabled={alarmBusy || !snapshot?.alarm?.enabled}
+                className="rounded border border-zinc-800 hover:border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+            {alarmBusy && (
+              <p className="text-[10px] text-zinc-500">
+                Talking to the strap…
+              </p>
+            )}
+          </div>
         </div>
       )}
 

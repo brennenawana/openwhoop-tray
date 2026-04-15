@@ -10,6 +10,12 @@ export type Snapshot = {
   next_sync_at: string | null;
   sync_in_progress: boolean;
   strap_seen_at: string | null;
+  alarm: AlarmStatus | null;
+};
+
+export type AlarmStatus = {
+  enabled: boolean;
+  at: string | null;
 };
 
 export type DiscoveredDevice = {

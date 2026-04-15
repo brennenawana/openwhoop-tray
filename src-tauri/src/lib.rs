@@ -8,7 +8,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use chrono::{Local, NaiveDateTime, TimeDelta, Timelike};
 use openwhoop::{OpenWhoop, WhoopDevice};
 use openwhoop_algos::{SleepConsistencyAnalyzer, SleepCycle};
-use openwhoop_codec::{WhoopPacket, constants::WHOOP_SERVICE};
+use openwhoop_codec::{WhoopData, WhoopPacket, constants::WHOOP_SERVICE};
 use openwhoop_db::DatabaseHandler;
 use openwhoop_entities::heart_rate;
 use openwhoop_types::activities::{ActivityPeriod, ActivityType, SearchActivityPeriods};
@@ -66,6 +66,7 @@ struct AppState {
     sync_cancel_reason: Arc<RwLock<Option<CancelReason>>>,
     strap_seen_at: RwLock<Option<NaiveDateTime>>,
     ble_lock: Arc<Mutex<()>>,
+    alarm: RwLock<Option<AlarmStatus>>,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -83,6 +84,13 @@ enum CancelReason {
     NoProgress,
 }
 
+#[derive(Serialize, Clone, Copy)]
+struct AlarmStatus {
+    enabled: bool,
+    /// Local-time alarm timestamp. None when disabled.
+    at: Option<NaiveDateTime>,
+}
+
 // ---------------------------------------------------------------- snapshot types
 
 #[derive(Serialize, Clone)]
@@ -98,6 +106,7 @@ struct Snapshot {
     next_sync_at: Option<NaiveDateTime>,
     sync_in_progress: bool,
     strap_seen_at: Option<NaiveDateTime>,
+    alarm: Option<AlarmStatus>,
 }
 
 #[derive(Serialize, Clone)]
@@ -196,6 +205,7 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let next_sync_at = *state.next_sync_at.read().await;
     let sync_in_progress = *state.sync_in_progress.read().await;
     let strap_seen_at = *state.strap_seen_at.read().await;
+    let alarm = *state.alarm.read().await;
     build_snapshot(
         &db,
         battery,
@@ -204,6 +214,7 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         next_sync_at,
         sync_in_progress,
         strap_seen_at,
+        alarm,
     )
     .await
     .map_err(|e| e.to_string())
@@ -214,6 +225,100 @@ async fn cancel_sync(state: State<'_, AppState>) -> Result<(), String> {
     *state.sync_cancel_reason.write().await = Some(CancelReason::User);
     state.sync_cancel.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+#[tauri::command]
+async fn get_alarm(app: AppHandle) -> Result<AlarmStatus, String> {
+    do_alarm_op(app, AlarmOp::Read).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_alarm(app: AppHandle, unix: i64) -> Result<AlarmStatus, String> {
+    let unix = u32::try_from(unix).map_err(|_| "alarm timestamp out of range".to_string())?;
+    do_alarm_op(app, AlarmOp::Set(unix)).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_alarm(app: AppHandle) -> Result<AlarmStatus, String> {
+    do_alarm_op(app, AlarmOp::Clear).await.map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Copy)]
+enum AlarmOp {
+    Read,
+    Set(u32),
+    Clear,
+}
+
+/// Connect to the strap, perform an alarm operation, and read back the
+/// resulting state so the UI can confirm what the strap actually has. Reuses
+/// the BLE lock so it can't race with sync or presence ping.
+async fn do_alarm_op(app: AppHandle, op: AlarmOp) -> anyhow::Result<AlarmStatus> {
+    let state = app.state::<AppState>();
+
+    if *state.sync_in_progress.read().await {
+        anyhow::bail!("Sync in progress — try again in a moment");
+    }
+
+    let device_name = state
+        .config
+        .read()
+        .await
+        .device_name
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Device not configured"))?;
+
+    let db_arc = ensure_db_from_handle(&app)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let db: DatabaseHandler = (*db_arc).clone();
+
+    // Hold the BLE adapter for the whole round trip.
+    let _ble_guard = state.ble_lock.clone().lock_owned().await;
+
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    let adapter = adapters
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
+
+    let peripheral = scan_for_device(&adapter, &device_name).await?;
+    let mut device = WhoopDevice::new(peripheral, adapter, db, false);
+    device.connect().await?;
+
+    // Apply the change. set/clear don't return useful responses, so we
+    // always follow with get_alarm to confirm.
+    if let AlarmOp::Set(unix) = op {
+        device.send_command(WhoopPacket::alarm_time(unix)).await?;
+    }
+    if matches!(op, AlarmOp::Clear) {
+        device.send_command(WhoopPacket::disable_alarm()).await?;
+    }
+
+    // Tiny delay so the strap has a moment to commit set/clear before we
+    // read it back.
+    if !matches!(op, AlarmOp::Read) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let info = device.get_alarm().await?;
+    let status = match info {
+        WhoopData::AlarmInfo { enabled, unix } => AlarmStatus {
+            enabled,
+            at: enabled.then(|| {
+                chrono::DateTime::from_timestamp(i64::from(unix), 0)
+                    .map(|dt| dt.with_timezone(&Local).naive_local())
+                    .unwrap_or_else(|| Local::now().naive_local())
+            }),
+        },
+        _ => anyhow::bail!("unexpected response to GetAlarmTime"),
+    };
+
+    *state.alarm.write().await = Some(status);
+    *state.strap_seen_at.write().await = Some(Local::now().naive_local());
+
+    Ok(status)
 }
 
 #[tauri::command]
@@ -614,6 +719,7 @@ async fn build_snapshot(
     next_sync_at: Option<NaiveDateTime>,
     sync_in_progress: bool,
     strap_seen_at: Option<NaiveDateTime>,
+    alarm: Option<AlarmStatus>,
 ) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
     let today = now.date();
@@ -647,6 +753,7 @@ async fn build_snapshot(
         next_sync_at,
         sync_in_progress,
         strap_seen_at,
+        alarm,
     })
 }
 
@@ -1011,6 +1118,7 @@ pub fn run() {
             sync_cancel_reason: Arc::new(RwLock::new(None)),
             strap_seen_at: RwLock::new(None),
             ble_lock: Arc::new(Mutex::new(())),
+            alarm: RwLock::new(None),
         })
         .setup(|app| {
             // Config path: ~/Library/Application Support/dev.brennen.openwhoop-tray/config.json
@@ -1115,6 +1223,9 @@ pub fn run() {
             scan_devices,
             get_autostart,
             set_autostart,
+            get_alarm,
+            set_alarm,
+            clear_alarm,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
