@@ -1,13 +1,19 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
+use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::platform::{Adapter, Manager, Peripheral};
 use chrono::{Local, NaiveDateTime, Timelike};
+use openwhoop::{OpenWhoop, WhoopDevice};
 use openwhoop_algos::{SleepConsistencyAnalyzer, SleepCycle};
+use openwhoop_codec::{WhoopPacket, constants::WHOOP_SERVICE};
 use openwhoop_db::DatabaseHandler;
 use openwhoop_entities::heart_rate;
 use openwhoop_types::activities::{ActivityPeriod, ActivityType, SearchActivityPeriods};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use serde::Serialize;
-use tauri::{Manager, State};
+use tauri::{Manager as _, State};
 use tokio::sync::RwLock;
 
 struct AppState {
@@ -92,11 +98,115 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     build_snapshot(&db).await.map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+struct SyncReport {
+    duration_secs: f64,
+    new_readings: usize,
+    total_readings: usize,
+    sleep_nights: usize,
+    activities: usize,
+}
+
 #[tauri::command]
-async fn sync_now(_state: State<'_, AppState>) -> Result<String, String> {
-    // Phase 1b: actually run download-history + detect-events + calculate-*.
-    // For now this is a placeholder so the UI has something to invoke.
-    Err("sync not yet wired up".to_string())
+async fn sync_now(
+    state: State<'_, AppState>,
+    device_name: String,
+) -> Result<SyncReport, String> {
+    let db_arc = ensure_db(&state).await?;
+    let db: DatabaseHandler = (*db_arc).clone();
+
+    run_sync(db, device_name).await.map_err(|e| e.to_string())
+}
+
+async fn run_sync(db: DatabaseHandler, device_name: String) -> anyhow::Result<SyncReport> {
+    let start = Instant::now();
+    let before = heart_rate::Entity::find().count(db.connection()).await? as usize;
+
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    let adapter = adapters
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
+
+    let peripheral = scan_for_device(&adapter, &device_name).await?;
+    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false);
+
+    let should_exit = Arc::new(AtomicBool::new(false));
+    device.connect().await?;
+    device.initialize().await?;
+    device.sync_history(should_exit).await?;
+
+    // Put the strap back in low-power mode (mirrors CLI behavior).
+    if device.is_connected().await.unwrap_or(false) {
+        let _ = device
+            .send_command(WhoopPacket::exit_high_freq_sync())
+            .await;
+    }
+
+    // Post-sync processing on a fresh OpenWhoop handle.
+    let whoop = OpenWhoop::new(db.clone());
+    whoop.detect_sleeps().await?;
+    whoop.detect_events().await?;
+    whoop.calculate_stress().await?;
+    whoop.calculate_spo2().await?;
+    whoop.calculate_skin_temp().await?;
+
+    let after = heart_rate::Entity::find().count(db.connection()).await? as usize;
+    let sleep_nights = db.get_sleep_cycles(None).await?.len();
+    let activities = db
+        .search_activities(SearchActivityPeriods::default())
+        .await?
+        .len();
+
+    Ok(SyncReport {
+        duration_secs: start.elapsed().as_secs_f64(),
+        new_readings: after.saturating_sub(before),
+        total_readings: after,
+        sleep_nights,
+        activities,
+    })
+}
+
+async fn scan_for_device(adapter: &Adapter, name_prefix: &str) -> anyhow::Result<Peripheral> {
+    adapter
+        .start_scan(ScanFilter {
+            services: vec![WHOOP_SERVICE],
+        })
+        .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if Instant::now() > deadline {
+            let _ = adapter.stop_scan().await;
+            anyhow::bail!("Device '{}' not found within 30s", name_prefix);
+        }
+
+        for peripheral in adapter.peripherals().await? {
+            let Ok(Some(properties)) = peripheral.properties().await else {
+                continue;
+            };
+            if !properties.services.contains(&WHOOP_SERVICE) {
+                continue;
+            }
+            let Some(local_name) = properties.local_name else {
+                continue;
+            };
+            if sanitize_name(&local_name).starts_with(name_prefix) {
+                return Ok(peripheral);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 async fn build_snapshot(db: &DatabaseHandler) -> anyhow::Result<Snapshot> {

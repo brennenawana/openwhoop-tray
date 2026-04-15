@@ -124,17 +124,38 @@ function cToF(c: number): number {
   return c * 9 / 5 + 32;
 }
 
+type SyncReport = {
+  duration_secs: number;
+  new_readings: number;
+  total_readings: number;
+  sleep_nights: number;
+  activities: number;
+};
+
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [lastSync, setLastSync] = useState<SyncReport | null>(null);
   const [tempUnit, setTempUnit] = useState<TempUnit>(() => {
     return (localStorage.getItem("tempUnit") as TempUnit) || "C";
   });
+  const [deviceName, setDeviceName] = useState<string>(() => {
+    return localStorage.getItem("deviceName") || "";
+  });
+  const [showSettings, setShowSettings] = useState<boolean>(() => {
+    return !localStorage.getItem("deviceName");
+  });
+
   const toggleTemp = () => {
     const next: TempUnit = tempUnit === "C" ? "F" : "C";
     setTempUnit(next);
     localStorage.setItem("tempUnit", next);
+  };
+
+  const saveDeviceName = (name: string) => {
+    setDeviceName(name);
+    localStorage.setItem("deviceName", name);
   };
 
   const refresh = useCallback(async () => {
@@ -152,9 +173,18 @@ function App() {
   }, [refresh]);
 
   const onSync = async () => {
+    if (!deviceName.trim()) {
+      setShowSettings(true);
+      setError("Set a device name first.");
+      return;
+    }
     setSyncing(true);
+    setError(null);
     try {
-      await invoke("sync_now");
+      const report = await invoke<SyncReport>("sync_now", {
+        deviceName: deviceName.trim(),
+      });
+      setLastSync(report);
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -168,24 +198,64 @@ function App() {
   const w = snapshot?.week;
 
   return (
-    <main className="flex flex-col h-screen px-6 py-5 gap-6 text-zinc-100">
+    <main className="flex flex-col h-screen overflow-y-auto px-6 py-5 gap-6 text-zinc-100">
       <header className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">OpenWhoop</h1>
           <p className="text-xs text-zinc-500">
-            {snapshot
+            {syncing
+              ? "Syncing with strap…"
+              : snapshot
               ? `Last refresh ${formatClock(snapshot.generated_at)}`
               : "Loading…"}
           </p>
         </div>
-        <button
-          onClick={onSync}
-          disabled={syncing}
-          className="rounded-md bg-rose-500/90 hover:bg-rose-500 active:bg-rose-600 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-1.5 text-xs font-medium transition-colors"
-        >
-          {syncing ? "Syncing…" : "Sync now"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowSettings((v) => !v)}
+            className="rounded-md border border-zinc-800 hover:border-zinc-700 px-2 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
+            title="Settings"
+          >
+            ⚙
+          </button>
+          <button
+            onClick={onSync}
+            disabled={syncing}
+            className="rounded-md bg-rose-500/90 hover:bg-rose-500 active:bg-rose-600 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-1.5 text-xs font-medium transition-colors"
+          >
+            {syncing ? "Syncing…" : "Sync now"}
+          </button>
+        </div>
       </header>
+
+      {showSettings && (
+        <div className="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-3">
+          <label className="text-[10px] uppercase tracking-wider text-zinc-500">
+            Device name
+          </label>
+          <input
+            type="text"
+            value={deviceName}
+            onChange={(e) => saveDeviceName(e.target.value)}
+            placeholder="WHOOP 4C0968309"
+            className="rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600"
+          />
+          <p className="text-[10px] text-zinc-600">
+            The name your strap broadcasts over Bluetooth. Run{" "}
+            <code className="text-zinc-400">openwhoop scan</code> in a terminal
+            to find it.
+          </p>
+        </div>
+      )}
+
+      {lastSync && !syncing && (
+        <div className="rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
+          Synced in {lastSync.duration_secs.toFixed(1)}s · +
+          {lastSync.new_readings} new readings · {lastSync.total_readings}{" "}
+          total · {lastSync.sleep_nights} sleep nights ·{" "}
+          {lastSync.activities} activities
+        </div>
+      )}
 
       {error && (
         <div className="rounded-md border border-rose-900/50 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
