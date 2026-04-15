@@ -55,6 +55,73 @@ const INTERVAL_OPTIONS: { label: string; minutes: number }[] = [
   { label: "Daily", minutes: 1440 },
 ];
 
+type ClassifiedError = {
+  message: string;
+  hint: string | null;
+  retryable: boolean;
+};
+
+function classifyError(raw: string): ClassifiedError {
+  const s = raw.toLowerCase();
+  if (s.includes("not found within")) {
+    return {
+      message: "Strap not in range",
+      hint: "Move closer to the strap and try again.",
+      retryable: true,
+    };
+  }
+  if (s.includes("no bluetooth adapter")) {
+    return {
+      message: "Bluetooth unavailable",
+      hint: "Enable Bluetooth in System Settings → Privacy & Security.",
+      retryable: true,
+    };
+  }
+  if (s.includes("whoop disconnected") || s.includes("disconnected mid")) {
+    return {
+      message: "Connection dropped mid-sync",
+      hint: "The strap disconnected. Try again.",
+      retryable: true,
+    };
+  }
+  if (s.includes("timed out after") && s.includes("seconds")) {
+    return {
+      message: "Sync timed out",
+      hint: "The strap took too long to respond. Try again or reboot the strap.",
+      retryable: true,
+    };
+  }
+  if (s.includes("stopped sending data")) {
+    return {
+      message: "Strap went quiet",
+      hint: "No data received for 30 seconds. Try again or reboot the strap.",
+      retryable: true,
+    };
+  }
+  if (s.includes("device not configured")) {
+    return {
+      message: "No strap configured",
+      hint: "Open settings and scan for your strap.",
+      retryable: false,
+    };
+  }
+  if (s.includes("sync in progress") || s.includes("already in progress")) {
+    return {
+      message: "Sync already running",
+      hint: null,
+      retryable: false,
+    };
+  }
+  if (s.includes("sync cancelled")) {
+    return {
+      message: "Sync cancelled",
+      hint: null,
+      retryable: true,
+    };
+  }
+  return { message: raw, hint: null, retryable: true };
+}
+
 function Sparkline({ values }: { values: (number | null)[] }) {
   const filled = values.filter((v): v is number => v !== null);
   if (filled.length === 0) {
@@ -735,11 +802,38 @@ function App() {
         </div>
       )}
 
-      {error && (
-        <div className="rounded-md border border-rose-900/50 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
-          {error}
-        </div>
-      )}
+      {error &&
+        (() => {
+          const c = classifyError(error);
+          return (
+            <div className="flex items-start gap-2 rounded-md border border-rose-900/50 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
+              <div className="flex-1 flex flex-col gap-0.5">
+                <span className="font-medium">{c.message}</span>
+                {c.hint && (
+                  <span className="text-rose-400/70">{c.hint}</span>
+                )}
+              </div>
+              {c.retryable && !syncing && (
+                <button
+                  onClick={() => {
+                    setError(null);
+                    onSync();
+                  }}
+                  className="rounded border border-rose-800 hover:border-rose-700 px-2 py-0.5 text-[10px] text-rose-300 hover:text-rose-100 transition-colors"
+                >
+                  Retry
+                </button>
+              )}
+              <button
+                onClick={() => setError(null)}
+                className="text-rose-400/60 hover:text-rose-300 leading-none"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          );
+        })()}
 
       <Section title="Today">
         {t && t.sample_count > 0 ? (
