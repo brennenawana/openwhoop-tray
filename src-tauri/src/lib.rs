@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral};
-use chrono::{Local, NaiveDateTime, Timelike};
+use chrono::{Local, NaiveDateTime, TimeDelta, Timelike};
 use openwhoop::{OpenWhoop, WhoopDevice};
 use openwhoop_algos::{SleepConsistencyAnalyzer, SleepCycle};
 use openwhoop_codec::{WhoopPacket, constants::WHOOP_SERVICE};
@@ -19,13 +19,17 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
-use tokio::sync::RwLock;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tokio::sync::{Notify, RwLock};
 
 // ---------------------------------------------------------------- config
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Config {
     device_name: Option<String>,
+    /// Minutes between automatic syncs. None or 0 = manual only.
+    #[serde(default)]
+    sync_interval_minutes: Option<u32>,
 }
 
 impl Config {
@@ -53,6 +57,10 @@ struct AppState {
     config: RwLock<Config>,
     config_path: RwLock<Option<PathBuf>>,
     battery: RwLock<Option<BatteryInfo>>,
+    sync_in_progress: RwLock<bool>,
+    last_sync_at: RwLock<Option<NaiveDateTime>>,
+    next_sync_at: RwLock<Option<NaiveDateTime>>,
+    scheduler_notify: Arc<Notify>,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -73,6 +81,15 @@ struct Snapshot {
     week: WeekSection,
     recent_activities: Vec<ActivitySummary>,
     battery: Option<BatteryInfo>,
+    last_sync_at: Option<NaiveDateTime>,
+    next_sync_at: Option<NaiveDateTime>,
+    sync_in_progress: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct DiscoveredDevice {
+    name: String,
+    rssi: Option<i16>,
 }
 
 #[derive(Serialize, Clone)]
@@ -160,7 +177,18 @@ async fn ensure_db_from_handle(app: &AppHandle) -> Result<Arc<DatabaseHandler>, 
 async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let db = ensure_db(&state).await?;
     let battery = *state.battery.read().await;
-    build_snapshot(&db, battery).await.map_err(|e| e.to_string())
+    let last_sync_at = *state.last_sync_at.read().await;
+    let next_sync_at = *state.next_sync_at.read().await;
+    let sync_in_progress = *state.sync_in_progress.read().await;
+    build_snapshot(
+        &db,
+        battery,
+        last_sync_at,
+        next_sync_at,
+        sync_in_progress,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -181,18 +209,123 @@ async fn set_device_name(
         .clone()
         .ok_or_else(|| "config path not initialized".to_string())?;
 
-    let mut cfg = state.config.write().await;
-    cfg.device_name = if trimmed.is_empty() {
-        None
+    {
+        let mut cfg = state.config.write().await;
+        cfg.device_name = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        cfg.save(&path).map_err(|e| e.to_string())?;
+    }
+    state.scheduler_notify.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_sync_interval(
+    state: State<'_, AppState>,
+    minutes: Option<u32>,
+) -> Result<(), String> {
+    let path = state
+        .config_path
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "config path not initialized".to_string())?;
+    {
+        let mut cfg = state.config.write().await;
+        cfg.sync_interval_minutes = minutes.and_then(|m| (m > 0).then_some(m));
+        cfg.save(&path).map_err(|e| e.to_string())?;
+    }
+    state.scheduler_notify.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+async fn scan_devices(app: AppHandle) -> Result<Vec<DiscoveredDevice>, String> {
+    let manager = Manager::new().await.map_err(|e| e.to_string())?;
+    let adapters = manager.adapters().await.map_err(|e| e.to_string())?;
+    let adapter = adapters
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No Bluetooth adapter found".to_string())?;
+
+    adapter
+        .start_scan(ScanFilter {
+            services: vec![WHOOP_SERVICE],
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = app.emit("scan:started", ());
+
+    // Poll for ~8 seconds so a nearby strap has a chance to advertise.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let mut results: Vec<DiscoveredDevice> = Vec::new();
+    for p in adapter.peripherals().await.map_err(|e| e.to_string())? {
+        let Ok(Some(props)) = p.properties().await else {
+            continue;
+        };
+        if !props.services.contains(&WHOOP_SERVICE) {
+            continue;
+        }
+        if let Some(name) = props.local_name {
+            let sanitized = sanitize_name(&name);
+            if !sanitized.is_empty() {
+                results.push(DiscoveredDevice {
+                    name: sanitized,
+                    rssi: props.rssi,
+                });
+            }
+        }
+    }
+    let _ = adapter.stop_scan().await;
+
+    // Dedupe by name, keep the strongest signal.
+    results.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+    results.dedup_by(|a, b| a.name == b.name);
+
+    let _ = app.emit("scan:done", results.len());
+    Ok(results)
+}
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable().map_err(|e| e.to_string())
     } else {
-        Some(trimmed)
-    };
-    cfg.save(&path).map_err(|e| e.to_string())
+        manager.disable().map_err(|e| e.to_string())
+    }
 }
 
 #[tauri::command]
 async fn sync_now(app: AppHandle) -> Result<SyncReport, String> {
-    do_sync(app).await.map_err(|e| e.to_string())
+    do_sync_guarded(app).await.map_err(|e| e.to_string())
+}
+
+async fn do_sync_guarded(app: AppHandle) -> anyhow::Result<SyncReport> {
+    let state = app.state::<AppState>();
+    {
+        let mut flag = state.sync_in_progress.write().await;
+        if *flag {
+            anyhow::bail!("sync already in progress");
+        }
+        *flag = true;
+    }
+    let result = do_sync(app.clone()).await;
+    *state.sync_in_progress.write().await = false;
+    if result.is_ok() {
+        *state.last_sync_at.write().await = Some(Local::now().naive_local());
+    }
+    result
 }
 
 // ---------------------------------------------------------------- sync pipeline
@@ -358,6 +491,9 @@ async fn read_device_status(device: &mut WhoopDevice) -> anyhow::Result<BatteryI
 async fn build_snapshot(
     db: &DatabaseHandler,
     battery: Option<BatteryInfo>,
+    last_sync_at: Option<NaiveDateTime>,
+    next_sync_at: Option<NaiveDateTime>,
+    sync_in_progress: bool,
 ) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
     let today = now.date();
@@ -386,6 +522,9 @@ async fn build_snapshot(
         week: build_week(&sleep_cycles, &recent_activities, week_start)?,
         recent_activities: build_activity_list(&recent_activities),
         battery,
+        last_sync_at,
+        next_sync_at,
+        sync_in_progress,
     })
 }
 
@@ -545,7 +684,7 @@ fn show_main_window(app: &AppHandle) {
 fn trigger_sync_from_tray(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        match do_sync(app.clone()).await {
+        match do_sync_guarded(app.clone()).await {
             Ok(report) => {
                 let _ = app.emit("sync:complete", report);
             }
@@ -556,18 +695,99 @@ fn trigger_sync_from_tray(app: &AppHandle) {
     });
 }
 
+/// Long-running scheduler task. Runs the initial sync on startup (if the
+/// device is configured), then sleeps until the next interval or until the
+/// scheduler_notify is triggered (e.g. by set_sync_interval / set_device_name).
+async fn scheduler_loop(app: AppHandle) {
+    // Give the runtime a moment to finish setup before the first sync.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    loop {
+        let state = app.state::<AppState>();
+
+        let (interval_mins, has_device) = {
+            let cfg = state.config.read().await;
+            (
+                cfg.sync_interval_minutes.unwrap_or(0),
+                cfg.device_name.is_some(),
+            )
+        };
+
+        if !has_device {
+            *state.next_sync_at.write().await = None;
+            state.scheduler_notify.notified().await;
+            continue;
+        }
+
+        // Decide when the next sync should run.
+        let now = Local::now().naive_local();
+        let last = *state.last_sync_at.read().await;
+        let next = match (last, interval_mins) {
+            // Never synced this session, and we have a device: sync immediately.
+            (None, _) => now,
+            // Manual-only mode with a prior sync: wait for a notify.
+            (Some(_), 0) => {
+                *state.next_sync_at.write().await = None;
+                state.scheduler_notify.notified().await;
+                continue;
+            }
+            // Scheduled mode: base the next run off the last sync time.
+            (Some(t), mins) => t + TimeDelta::minutes(mins as i64),
+        };
+        *state.next_sync_at.write().await = Some(next);
+
+        let wait = (next - Local::now().naive_local())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+
+        // Sleep until due, or wake early on settings change.
+        let notify = state.scheduler_notify.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {
+                run_scheduled_sync(&app).await;
+            }
+            _ = notify.notified() => {
+                // Settings changed — recompute.
+                continue;
+            }
+        }
+    }
+}
+
+async fn run_scheduled_sync(app: &AppHandle) {
+    match do_sync_guarded(app.clone()).await {
+        Ok(report) => {
+            let _ = app.emit("sync:complete", report);
+        }
+        Err(e) => {
+            eprintln!("scheduled sync failed: {}", e);
+            let _ = app.emit("sync:error", e.to_string());
+            // Brief back-off so we don't hammer a failing strap.
+            tokio::time::sleep(Duration::from_secs(180)).await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- run
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AppState {
             db: RwLock::new(None),
             db_path: RwLock::new(None),
             config: RwLock::new(Config::default()),
             config_path: RwLock::new(None),
             battery: RwLock::new(None),
+            sync_in_progress: RwLock::new(false),
+            last_sync_at: RwLock::new(None),
+            next_sync_at: RwLock::new(None),
+            scheduler_notify: Arc::new(Notify::new()),
         })
         .setup(|app| {
             // Config path: ~/Library/Application Support/dev.brennen.openwhoop-tray/config.json
@@ -644,6 +864,14 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Background scheduler: runs an immediate sync at startup
+            // (if the device is configured) and then cycles based on
+            // the user's sync_interval_minutes setting.
+            let scheduler_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                scheduler_loop(scheduler_handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -651,6 +879,10 @@ pub fn run() {
             sync_now,
             get_config,
             set_device_name,
+            set_sync_interval,
+            scan_devices,
+            get_autostart,
+            set_autostart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

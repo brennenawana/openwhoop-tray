@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Snapshot } from "./types";
+import type { DiscoveredDevice, Snapshot } from "./types";
 import "./App.css";
 
 type SyncStage = "scanning" | "connecting" | "downloading" | "processing" | "done";
@@ -35,6 +35,25 @@ function formatClock(iso: string | null): string {
     second: "2-digit",
   });
 }
+
+function formatRelative(iso: string | null, prefix: string): string | null {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms < 30_000 && ms > -30_000) return `${prefix} now`;
+  const absMs = Math.abs(ms);
+  const mins = Math.round(absMs / 60000);
+  const hours = Math.round(absMs / 3600000);
+  const unit = mins < 60 ? `${mins}m` : `${hours}h`;
+  return ms > 0 ? `${prefix} in ${unit}` : `${prefix} ${unit} ago`;
+}
+
+const INTERVAL_OPTIONS: { label: string; minutes: number }[] = [
+  { label: "Manual only", minutes: 0 },
+  { label: "Every 15 minutes", minutes: 15 },
+  { label: "Every hour", minutes: 60 },
+  { label: "Every 4 hours", minutes: 240 },
+  { label: "Daily", minutes: 1440 },
+];
 
 function Sparkline({ values }: { values: (number | null)[] }) {
   const filled = values.filter((v): v is number => v !== null);
@@ -182,6 +201,7 @@ type SyncReport = {
 
 type BackendConfig = {
   device_name: string | null;
+  sync_interval_minutes: number | null;
 };
 
 function App() {
@@ -195,6 +215,17 @@ function App() {
   });
   const [deviceName, setDeviceName] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [syncInterval, setSyncInterval] = useState<number>(0);
+  const [autostart, setAutostart] = useState<boolean>(false);
+  const [scanning, setScanning] = useState<boolean>(false);
+  const [scanResults, setScanResults] = useState<DiscoveredDevice[]>([]);
+  const [tick, setTick] = useState(0);
+  // tick increments every 30s so the "Next sync in Xm" label re-renders
+  useEffect(() => {
+    const i = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(i);
+  }, []);
+  void tick;
 
   const toggleTemp = () => {
     const next: TempUnit = tempUnit === "C" ? "F" : "C";
@@ -211,6 +242,41 @@ function App() {
     }
   };
 
+  const saveSyncInterval = async (minutes: number) => {
+    setSyncInterval(minutes);
+    try {
+      await invoke("set_sync_interval", {
+        minutes: minutes === 0 ? null : minutes,
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const saveAutostart = async (enabled: boolean) => {
+    setAutostart(enabled);
+    try {
+      await invoke("set_autostart", { enabled });
+    } catch (e) {
+      setError(String(e));
+      setAutostart(!enabled);
+    }
+  };
+
+  const onScanDevices = async () => {
+    setScanning(true);
+    setError(null);
+    setScanResults([]);
+    try {
+      const devices = await invoke<DiscoveredDevice[]>("scan_devices");
+      setScanResults(devices);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const refresh = useCallback(async () => {
     try {
       const snap = await invoke<Snapshot>("get_snapshot");
@@ -221,19 +287,29 @@ function App() {
     }
   }, []);
 
-  // Initial hydration: load config from backend, then snapshot.
+  // Initial hydration: load config + autostart state, then snapshot. Also
+  // poll snapshot every 30s so scheduler-driven syncs show up live.
   useEffect(() => {
     (async () => {
       try {
         const cfg = await invoke<BackendConfig>("get_config");
         const name = cfg.device_name ?? "";
         setDeviceName(name);
+        setSyncInterval(cfg.sync_interval_minutes ?? 0);
         if (!name) setShowSettings(true);
       } catch (e) {
         setError(String(e));
       }
+      try {
+        const enabled = await invoke<boolean>("get_autostart");
+        setAutostart(enabled);
+      } catch {
+        // non-fatal
+      }
       refresh();
     })();
+    const poll = setInterval(refresh, 30_000);
+    return () => clearInterval(poll);
   }, [refresh]);
 
   // Subscribe to sync lifecycle events from the backend (including tray-initiated syncs).
@@ -311,6 +387,12 @@ function App() {
               ? STAGE_LABEL[syncStage]
               : syncing
               ? "Syncing with strap…"
+              : snapshot?.next_sync_at
+              ? formatRelative(snapshot.next_sync_at, "Next sync") ??
+                `Last refresh ${formatClock(snapshot.generated_at)}`
+              : snapshot?.last_sync_at
+              ? formatRelative(snapshot.last_sync_at, "Last sync") ??
+                `Last refresh ${formatClock(snapshot.generated_at)}`
               : snapshot
               ? `Last refresh ${formatClock(snapshot.generated_at)}`
               : "Loading…"}
@@ -335,22 +417,85 @@ function App() {
       </header>
 
       {showSettings && (
-        <div className="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-3">
-          <label className="text-[10px] uppercase tracking-wider text-zinc-500">
-            Device name
+        <div className="flex flex-col gap-4 rounded-md border border-zinc-800 bg-zinc-950/60 p-3">
+          <div className="flex flex-col gap-2">
+            <label className="text-[10px] uppercase tracking-wider text-zinc-500">
+              Device
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={deviceName}
+                onChange={(e) => saveDeviceName(e.target.value)}
+                placeholder="WHOOP 4C0968309"
+                className="flex-1 rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600"
+              />
+              <button
+                onClick={onScanDevices}
+                disabled={scanning}
+                className="rounded border border-zinc-800 hover:border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {scanning ? "Scanning…" : "Scan"}
+              </button>
+            </div>
+            {scanResults.length > 0 && (
+              <ul className="flex flex-col gap-1 rounded border border-zinc-800 bg-black/40 p-1.5">
+                {scanResults.map((d) => (
+                  <li key={d.name}>
+                    <button
+                      onClick={() => {
+                        saveDeviceName(d.name);
+                        setScanResults([]);
+                      }}
+                      className="w-full text-left rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800/70 flex items-center justify-between"
+                    >
+                      <span>{d.name}</span>
+                      {d.rssi != null && (
+                        <span className="text-[10px] text-zinc-500 tabular-nums">
+                          {d.rssi} dBm
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {!scanning && scanResults.length === 0 && (
+              <p className="text-[10px] text-zinc-600">
+                Click Scan to discover nearby WHOOP straps, or type the name
+                manually.
+              </p>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <label className="text-[10px] uppercase tracking-wider text-zinc-500">
+              Auto-sync
+            </label>
+            <select
+              value={syncInterval}
+              onChange={(e) => saveSyncInterval(Number(e.target.value))}
+              className="rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600"
+            >
+              {INTERVAL_OPTIONS.map((opt) => (
+                <option key={opt.minutes} value={opt.minutes}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <label className="flex items-center justify-between cursor-pointer">
+            <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+              Launch at login
+            </span>
+            <input
+              type="checkbox"
+              checked={autostart}
+              onChange={(e) => saveAutostart(e.target.checked)}
+              className="accent-rose-500"
+            />
           </label>
-          <input
-            type="text"
-            value={deviceName}
-            onChange={(e) => saveDeviceName(e.target.value)}
-            placeholder="WHOOP 4C0968309"
-            className="rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600"
-          />
-          <p className="text-[10px] text-zinc-600">
-            The name your strap broadcasts over Bluetooth. Run{" "}
-            <code className="text-zinc-400">openwhoop scan</code> in a terminal
-            to find it.
-          </p>
         </div>
       )}
 

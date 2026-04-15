@@ -5,6 +5,14 @@ export type Snapshot = {
   week: WeekSection;
   recent_activities: ActivitySummary[];
   battery: BatteryInfo | null;
+  last_sync_at: string | null;
+  next_sync_at: string | null;
+  sync_in_progress: boolean;
+};
+
+export type DiscoveredDevice = {
+  name: string;
+  rssi: number | null;
 };
 
 export type BatteryInfo = {
