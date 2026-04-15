@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager as _, State, Wry,
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::TrayIconBuilder,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -934,20 +934,6 @@ fn build_activity_list(activities: &[ActivityPeriod]) -> Vec<ActivitySummary> {
 
 // ---------------------------------------------------------------- window + tray
 
-fn toggle_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        match window.is_visible() {
-            Ok(true) => {
-                let _ = window.hide();
-            }
-            _ => {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }
-    }
-}
-
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -1331,24 +1317,12 @@ pub fn run() {
             TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
                     "sync" => trigger_sync_from_tray(app),
                     "quit" => app.exit(0),
                     _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if matches!(
-                        event,
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        }
-                    ) {
-                        toggle_main_window(tray.app_handle());
-                    }
                 })
                 .build(app)?;
 
