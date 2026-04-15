@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -12,16 +13,50 @@ use openwhoop_db::DatabaseHandler;
 use openwhoop_entities::heart_rate;
 use openwhoop_types::activities::{ActivityPeriod, ActivityType, SearchActivityPeriods};
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
-use serde::Serialize;
-use tauri::{Manager as _, State};
+use serde::{Deserialize, Serialize};
+use tauri::{
+    AppHandle, Emitter, Manager as _, State,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tokio::sync::RwLock;
+
+// ---------------------------------------------------------------- config
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Config {
+    device_name: Option<String>,
+}
+
+impl Config {
+    fn load(path: &PathBuf) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- state
 
 struct AppState {
     db: RwLock<Option<Arc<DatabaseHandler>>>,
     db_path: RwLock<Option<String>>,
+    config: RwLock<Config>,
+    config_path: RwLock<Option<PathBuf>>,
 }
 
-#[derive(Serialize)]
+// ---------------------------------------------------------------- snapshot types
+
+#[derive(Serialize, Clone)]
 struct Snapshot {
     generated_at: NaiveDateTime,
     today: TodaySection,
@@ -30,7 +65,7 @@ struct Snapshot {
     recent_activities: Vec<ActivitySummary>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TodaySection {
     sample_count: usize,
     last_seen: Option<NaiveDateTime>,
@@ -44,7 +79,7 @@ struct TodaySection {
     hourly_bpm: [Option<u16>; 24],
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct SleepSection {
     night: String,
     start: NaiveDateTime,
@@ -59,7 +94,7 @@ struct SleepSection {
     max_hrv: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct WeekSection {
     sleep_nights: usize,
     avg_sleep_duration_minutes: Option<i64>,
@@ -69,13 +104,24 @@ struct WeekSection {
     workout_total_minutes: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ActivitySummary {
     kind: String,
     start: NaiveDateTime,
     end: NaiveDateTime,
     duration_minutes: i64,
 }
+
+#[derive(Serialize, Clone)]
+struct SyncReport {
+    duration_secs: f64,
+    new_readings: usize,
+    total_readings: usize,
+    sleep_nights: usize,
+    activities: usize,
+}
+
+// ---------------------------------------------------------------- helpers
 
 async fn ensure_db(state: &State<'_, AppState>) -> Result<Arc<DatabaseHandler>, String> {
     if let Some(db) = state.db.read().await.clone() {
@@ -92,36 +138,80 @@ async fn ensure_db(state: &State<'_, AppState>) -> Result<Arc<DatabaseHandler>, 
     Ok(handler)
 }
 
+async fn ensure_db_from_handle(app: &AppHandle) -> Result<Arc<DatabaseHandler>, String> {
+    let state = app.state::<AppState>();
+    ensure_db(&state).await
+}
+
+// ---------------------------------------------------------------- commands
+
 #[tauri::command]
 async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let db = ensure_db(&state).await?;
     build_snapshot(&db).await.map_err(|e| e.to_string())
 }
 
-#[derive(Serialize)]
-struct SyncReport {
-    duration_secs: f64,
-    new_readings: usize,
-    total_readings: usize,
-    sleep_nights: usize,
-    activities: usize,
+#[tauri::command]
+async fn get_config(state: State<'_, AppState>) -> Result<Config, String> {
+    Ok(state.config.read().await.clone())
 }
 
 #[tauri::command]
-async fn sync_now(
+async fn set_device_name(
     state: State<'_, AppState>,
-    device_name: String,
-) -> Result<SyncReport, String> {
-    let db_arc = ensure_db(&state).await?;
-    let db: DatabaseHandler = (*db_arc).clone();
+    name: String,
+) -> Result<(), String> {
+    let trimmed = name.trim().to_string();
+    let path = state
+        .config_path
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "config path not initialized".to_string())?;
 
-    run_sync(db, device_name).await.map_err(|e| e.to_string())
+    let mut cfg = state.config.write().await;
+    cfg.device_name = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
+    cfg.save(&path).map_err(|e| e.to_string())
 }
 
-async fn run_sync(db: DatabaseHandler, device_name: String) -> anyhow::Result<SyncReport> {
+#[tauri::command]
+async fn sync_now(app: AppHandle) -> Result<SyncReport, String> {
+    do_sync(app).await.map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------- sync pipeline
+
+async fn do_sync(app: AppHandle) -> anyhow::Result<SyncReport> {
+    let state = app.state::<AppState>();
+    let device_name = state
+        .config
+        .read()
+        .await
+        .device_name
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Device not configured"))?;
+
+    let db_arc = ensure_db_from_handle(&app)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let db: DatabaseHandler = (*db_arc).clone();
+
+    run_sync(&app, db, device_name).await
+}
+
+async fn run_sync(
+    app: &AppHandle,
+    db: DatabaseHandler,
+    device_name: String,
+) -> anyhow::Result<SyncReport> {
     let start = Instant::now();
     let before = heart_rate::Entity::find().count(db.connection()).await? as usize;
 
+    emit_progress(app, "scanning");
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
     let adapter = adapters
@@ -130,21 +220,23 @@ async fn run_sync(db: DatabaseHandler, device_name: String) -> anyhow::Result<Sy
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
     let peripheral = scan_for_device(&adapter, &device_name).await?;
-    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false);
 
-    let should_exit = Arc::new(AtomicBool::new(false));
+    emit_progress(app, "connecting");
+    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false);
     device.connect().await?;
     device.initialize().await?;
+
+    emit_progress(app, "downloading");
+    let should_exit = Arc::new(AtomicBool::new(false));
     device.sync_history(should_exit).await?;
 
-    // Put the strap back in low-power mode (mirrors CLI behavior).
     if device.is_connected().await.unwrap_or(false) {
         let _ = device
             .send_command(WhoopPacket::exit_high_freq_sync())
             .await;
     }
 
-    // Post-sync processing on a fresh OpenWhoop handle.
+    emit_progress(app, "processing");
     let whoop = OpenWhoop::new(db.clone());
     whoop.detect_sleeps().await?;
     whoop.detect_events().await?;
@@ -159,16 +251,26 @@ async fn run_sync(db: DatabaseHandler, device_name: String) -> anyhow::Result<Sy
         .await?
         .len();
 
-    Ok(SyncReport {
+    let report = SyncReport {
         duration_secs: start.elapsed().as_secs_f64(),
         new_readings: after.saturating_sub(before),
         total_readings: after,
         sleep_nights,
         activities,
-    })
+    };
+
+    emit_progress(app, "done");
+    Ok(report)
 }
 
-async fn scan_for_device(adapter: &Adapter, name_prefix: &str) -> anyhow::Result<Peripheral> {
+fn emit_progress(app: &AppHandle, stage: &str) {
+    let _ = app.emit("sync:progress", stage);
+}
+
+async fn scan_for_device(
+    adapter: &Adapter,
+    name_prefix: &str,
+) -> anyhow::Result<Peripheral> {
     adapter
         .start_scan(ScanFilter {
             services: vec![WHOOP_SERVICE],
@@ -208,6 +310,8 @@ fn sanitize_name(name: &str) -> String {
         .trim()
         .to_string()
 }
+
+// ---------------------------------------------------------------- snapshot build
 
 async fn build_snapshot(db: &DatabaseHandler) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
@@ -369,6 +473,45 @@ fn build_activity_list(activities: &[ActivityPeriod]) -> Vec<ActivitySummary> {
         .collect()
 }
 
+// ---------------------------------------------------------------- window + tray
+
+fn toggle_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        match window.is_visible() {
+            Ok(true) => {
+                let _ = window.hide();
+            }
+            _ => {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn trigger_sync_from_tray(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match do_sync(app.clone()).await {
+            Ok(report) => {
+                let _ = app.emit("sync:complete", report);
+            }
+            Err(e) => {
+                let _ = app.emit("sync:error", e.to_string());
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------- run
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -376,32 +519,92 @@ pub fn run() {
         .manage(AppState {
             db: RwLock::new(None),
             db_path: RwLock::new(None),
+            config: RwLock::new(Config::default()),
+            config_path: RwLock::new(None),
         })
         .setup(|app| {
-            // Default DB path: ~/Library/Application Support/dev.brennen.openwhoop-tray/db.sqlite
-            // Falls back to project-local db.sqlite if we can't resolve app dir.
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .ok()
-                .map(|p| {
-                    std::fs::create_dir_all(&p).ok();
-                    p.join("db.sqlite")
-                });
-            let path = data_dir
+            // Config path: ~/Library/Application Support/dev.brennen.openwhoop-tray/config.json
+            let app_data = app.path().app_data_dir().ok();
+            if let Some(ref dir) = app_data {
+                std::fs::create_dir_all(dir).ok();
+            }
+            let db_path_str = app_data
                 .as_ref()
-                .and_then(|p| p.to_str().map(|s| format!("sqlite://{}?mode=rwc", s)))
+                .and_then(|p| p.join("db.sqlite").to_str().map(String::from))
+                .map(|p| format!("sqlite://{}?mode=rwc", p))
                 .unwrap_or_else(|| "sqlite://db.sqlite?mode=rwc".to_string());
+            let config_path = app_data.map(|p| p.join("config.json"));
+
+            let loaded_config = config_path
+                .as_ref()
+                .map(Config::load)
+                .unwrap_or_default();
+            let first_run = loaded_config.device_name.is_none();
 
             let state = app.state::<AppState>();
-            let path_clone = path.clone();
+            let db_path_clone = db_path_str.clone();
+            let cfg_clone = loaded_config.clone();
+            let cfg_path_clone = config_path.clone();
             tauri::async_runtime::block_on(async move {
-                *state.db_path.write().await = Some(path_clone);
+                *state.db_path.write().await = Some(db_path_clone);
+                *state.config.write().await = cfg_clone;
+                *state.config_path.write().await = cfg_path_clone;
             });
-            eprintln!("openwhoop-tray: db = {}", path);
+
+            eprintln!("openwhoop-tray: db = {}", db_path_str);
+
+            // Hide from dock on macOS so this feels like a menu bar app.
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
+            if first_run {
+                show_main_window(&app.handle());
+            }
+
+            // Tray icon
+            let show_item =
+                MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
+            let sync_item =
+                MenuItem::with_id(app, "sync", "Sync Now", true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(app, "quit", "Quit OpenWhoop", true, None::<&str>)?;
+            let menu =
+                Menu::with_items(app, &[&show_item, &sync_item, &quit_item])?;
+
+            TrayIconBuilder::with_id("main-tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
+                    "sync" => trigger_sync_from_tray(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        toggle_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, sync_now])
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            sync_now,
+            get_config,
+            set_device_name,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

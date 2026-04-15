@@ -1,7 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Snapshot } from "./types";
 import "./App.css";
+
+type SyncStage = "scanning" | "connecting" | "downloading" | "processing" | "done";
+
+const STAGE_LABEL: Record<SyncStage, string> = {
+  scanning: "Scanning for strap…",
+  connecting: "Connecting…",
+  downloading: "Downloading history…",
+  processing: "Processing metrics…",
+  done: "Finishing up…",
+};
 
 function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
@@ -132,20 +143,21 @@ type SyncReport = {
   activities: number;
 };
 
+type BackendConfig = {
+  device_name: string | null;
+};
+
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [syncStage, setSyncStage] = useState<SyncStage | null>(null);
   const [lastSync, setLastSync] = useState<SyncReport | null>(null);
   const [tempUnit, setTempUnit] = useState<TempUnit>(() => {
     return (localStorage.getItem("tempUnit") as TempUnit) || "C";
   });
-  const [deviceName, setDeviceName] = useState<string>(() => {
-    return localStorage.getItem("deviceName") || "";
-  });
-  const [showSettings, setShowSettings] = useState<boolean>(() => {
-    return !localStorage.getItem("deviceName");
-  });
+  const [deviceName, setDeviceName] = useState<string>("");
+  const [showSettings, setShowSettings] = useState<boolean>(false);
 
   const toggleTemp = () => {
     const next: TempUnit = tempUnit === "C" ? "F" : "C";
@@ -153,9 +165,13 @@ function App() {
     localStorage.setItem("tempUnit", next);
   };
 
-  const saveDeviceName = (name: string) => {
+  const saveDeviceName = async (name: string) => {
     setDeviceName(name);
-    localStorage.setItem("deviceName", name);
+    try {
+      await invoke("set_device_name", { name });
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const refresh = useCallback(async () => {
@@ -168,8 +184,48 @@ function App() {
     }
   }, []);
 
+  // Initial hydration: load config from backend, then snapshot.
   useEffect(() => {
-    refresh();
+    (async () => {
+      try {
+        const cfg = await invoke<BackendConfig>("get_config");
+        const name = cfg.device_name ?? "";
+        setDeviceName(name);
+        if (!name) setShowSettings(true);
+      } catch (e) {
+        setError(String(e));
+      }
+      refresh();
+    })();
+  }, [refresh]);
+
+  // Subscribe to sync lifecycle events from the backend (including tray-initiated syncs).
+  useEffect(() => {
+    const unlistenFns: (() => void)[] = [];
+    (async () => {
+      unlistenFns.push(
+        await listen<SyncStage>("sync:progress", (e) => {
+          setSyncStage(e.payload);
+          setSyncing(e.payload !== "done");
+        })
+      );
+      unlistenFns.push(
+        await listen<SyncReport>("sync:complete", (e) => {
+          setLastSync(e.payload);
+          setSyncing(false);
+          setSyncStage(null);
+          refresh();
+        })
+      );
+      unlistenFns.push(
+        await listen<string>("sync:error", (e) => {
+          setError(e.payload);
+          setSyncing(false);
+          setSyncStage(null);
+        })
+      );
+    })();
+    return () => unlistenFns.forEach((fn) => fn());
   }, [refresh]);
 
   const onSync = async () => {
@@ -179,17 +235,17 @@ function App() {
       return;
     }
     setSyncing(true);
+    setSyncStage("scanning");
     setError(null);
     try {
-      const report = await invoke<SyncReport>("sync_now", {
-        deviceName: deviceName.trim(),
-      });
+      const report = await invoke<SyncReport>("sync_now");
       setLastSync(report);
       await refresh();
     } catch (e) {
       setError(String(e));
     } finally {
       setSyncing(false);
+      setSyncStage(null);
     }
   };
 
@@ -203,7 +259,9 @@ function App() {
         <div>
           <h1 className="text-lg font-semibold tracking-tight">OpenWhoop</h1>
           <p className="text-xs text-zinc-500">
-            {syncing
+            {syncing && syncStage
+              ? STAGE_LABEL[syncStage]
+              : syncing
               ? "Syncing with strap…"
               : snapshot
               ? `Last refresh ${formatClock(snapshot.generated_at)}`

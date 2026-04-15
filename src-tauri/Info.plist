@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>OpenWhoop uses Bluetooth to connect to your WHOOP strap and download your data locally. No data is sent to any server.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>OpenWhoop uses Bluetooth to connect to your WHOOP strap and download your data locally. No data is sent to any server.</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
