@@ -185,6 +185,32 @@ function WristPill({ isWorn }: { isWorn: boolean }) {
   );
 }
 
+function PresencePill({ seenAt }: { seenAt: string | null }) {
+  if (!seenAt) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-zinc-800 px-2 py-0.5 text-[9px] font-normal text-zinc-500">
+        <span className="w-1 h-1 rounded-full bg-zinc-600" />
+        not detected
+      </span>
+    );
+  }
+  const ageMs = Date.now() - new Date(seenAt).getTime();
+  const recent = ageMs < 5 * 60_000;
+  const label = recent
+    ? "in range"
+    : (formatRelative(seenAt, "seen") ?? "not detected");
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-zinc-800 px-2 py-0.5 text-[9px] font-normal text-zinc-400">
+      <span
+        className={`w-1 h-1 rounded-full ${
+          recent ? "bg-emerald-400" : "bg-zinc-600"
+        }`}
+      />
+      {label}
+    </span>
+  );
+}
+
 type TempUnit = "C" | "F";
 
 function cToF(c: number): number {
@@ -219,6 +245,7 @@ function App() {
   const [autostart, setAutostart] = useState<boolean>(false);
   const [scanning, setScanning] = useState<boolean>(false);
   const [scanResults, setScanResults] = useState<DiscoveredDevice[]>([]);
+  const [downloadCount, setDownloadCount] = useState<number>(0);
   const [tick, setTick] = useState(0);
   // tick increments every 30s so the "Next sync in Xm" label re-renders
   useEffect(() => {
@@ -320,6 +347,14 @@ function App() {
         await listen<SyncStage>("sync:progress", (e) => {
           setSyncStage(e.payload);
           setSyncing(e.payload !== "done");
+          if (e.payload === "scanning") {
+            setDownloadCount(0);
+          }
+        })
+      );
+      unlistenFns.push(
+        await listen<number>("sync:download_progress", (e) => {
+          setDownloadCount(e.payload);
         })
       );
       unlistenFns.push(
@@ -327,6 +362,7 @@ function App() {
           setLastSync(e.payload);
           setSyncing(false);
           setSyncStage(null);
+          setDownloadCount(0);
           refresh();
         })
       );
@@ -335,11 +371,20 @@ function App() {
           setError(e.payload);
           setSyncing(false);
           setSyncStage(null);
+          setDownloadCount(0);
         })
       );
     })();
     return () => unlistenFns.forEach((fn) => fn());
   }, [refresh]);
+
+  const onCancelSync = async () => {
+    try {
+      await invoke("cancel_sync");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const onSync = async () => {
     if (!deviceName.trim()) {
@@ -381,9 +426,14 @@ function App() {
                 <WristPill isWorn={snapshot.battery.is_worn} />
               </>
             )}
+            <PresencePill seenAt={snapshot?.strap_seen_at ?? null} />
           </h1>
           <p className="text-xs text-zinc-500">
-            {syncing && syncStage
+            {syncing && syncStage === "downloading" && downloadCount > 0
+              ? `Downloading… ${downloadCount.toLocaleString()} new readings`
+              : syncing && syncStage === "downloading"
+              ? "Downloading history…"
+              : syncing && syncStage
               ? STAGE_LABEL[syncStage]
               : syncing
               ? "Syncing with strap…"
@@ -406,13 +456,21 @@ function App() {
           >
             ⚙
           </button>
-          <button
-            onClick={onSync}
-            disabled={syncing}
-            className="rounded-md bg-rose-500/90 hover:bg-rose-500 active:bg-rose-600 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-1.5 text-xs font-medium transition-colors"
-          >
-            {syncing ? "Syncing…" : "Sync now"}
-          </button>
+          {syncing ? (
+            <button
+              onClick={onCancelSync}
+              className="rounded-md border border-zinc-700 hover:border-zinc-500 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-zinc-100 transition-colors"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              onClick={onSync}
+              className="rounded-md bg-rose-500/90 hover:bg-rose-500 active:bg-rose-600 px-3 py-1.5 text-xs font-medium transition-colors"
+            >
+              Sync now
+            </button>
+          )}
         </div>
       </header>
 

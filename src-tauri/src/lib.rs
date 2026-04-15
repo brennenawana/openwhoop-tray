@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
@@ -20,7 +20,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 // ---------------------------------------------------------------- config
 
@@ -59,8 +59,12 @@ struct AppState {
     battery: RwLock<Option<BatteryInfo>>,
     sync_in_progress: RwLock<bool>,
     last_sync_at: RwLock<Option<NaiveDateTime>>,
+    last_sync_attempt_at: RwLock<Option<NaiveDateTime>>,
     next_sync_at: RwLock<Option<NaiveDateTime>>,
     scheduler_notify: Arc<Notify>,
+    sync_cancel: Arc<AtomicBool>,
+    strap_seen_at: RwLock<Option<NaiveDateTime>>,
+    ble_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -82,8 +86,10 @@ struct Snapshot {
     recent_activities: Vec<ActivitySummary>,
     battery: Option<BatteryInfo>,
     last_sync_at: Option<NaiveDateTime>,
+    last_sync_attempt_at: Option<NaiveDateTime>,
     next_sync_at: Option<NaiveDateTime>,
     sync_in_progress: bool,
+    strap_seen_at: Option<NaiveDateTime>,
 }
 
 #[derive(Serialize, Clone)]
@@ -178,17 +184,27 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let db = ensure_db(&state).await?;
     let battery = *state.battery.read().await;
     let last_sync_at = *state.last_sync_at.read().await;
+    let last_sync_attempt_at = *state.last_sync_attempt_at.read().await;
     let next_sync_at = *state.next_sync_at.read().await;
     let sync_in_progress = *state.sync_in_progress.read().await;
+    let strap_seen_at = *state.strap_seen_at.read().await;
     build_snapshot(
         &db,
         battery,
         last_sync_at,
+        last_sync_attempt_at,
         next_sync_at,
         sync_in_progress,
+        strap_seen_at,
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_sync(state: State<'_, AppState>) -> Result<(), String> {
+    state.sync_cancel.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 #[tauri::command]
@@ -320,10 +336,21 @@ async fn do_sync_guarded(app: AppHandle) -> anyhow::Result<SyncReport> {
         }
         *flag = true;
     }
+    state.sync_cancel.store(false, Ordering::SeqCst);
+    *state.last_sync_attempt_at.write().await = Some(Local::now().naive_local());
+
+    // Wait for any in-flight presence ping to release the BLE adapter,
+    // then hold the lock for the duration of the sync.
+    let _ble_guard = state.ble_lock.clone().lock_owned().await;
     let result = do_sync(app.clone()).await;
+    drop(_ble_guard);
+
     *state.sync_in_progress.write().await = false;
     if result.is_ok() {
-        *state.last_sync_at.write().await = Some(Local::now().naive_local());
+        let now = Local::now().naive_local();
+        *state.last_sync_at.write().await = Some(now);
+        // Successful connect implies the strap was nearby.
+        *state.strap_seen_at.write().await = Some(now);
     }
     result
 }
@@ -353,8 +380,21 @@ async fn run_sync(
     db: DatabaseHandler,
     device_name: String,
 ) -> anyhow::Result<SyncReport> {
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
     let start = Instant::now();
     let before = heart_rate::Entity::find().count(db.connection()).await? as usize;
+
+    let cancel = app.state::<AppState>().sync_cancel.clone();
+
+    // Hard timeout: a parallel task flips the cancel flag after SYNC_TIMEOUT.
+    // sync_history checks the flag at the top of each iteration, so it will
+    // unwind cleanly. Aborted on success.
+    let timeout_cancel = cancel.clone();
+    let timeout_task = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SYNC_TIMEOUT).await;
+        timeout_cancel.store(true, Ordering::SeqCst);
+    });
 
     emit_progress(app, "scanning");
     let manager = Manager::new().await?;
@@ -365,6 +405,8 @@ async fn run_sync(
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
     let peripheral = scan_for_device(&adapter, &device_name).await?;
+    // Strap responded to the scan — mark presence even if later steps fail.
+    *app.state::<AppState>().strap_seen_at.write().await = Some(Local::now().naive_local());
 
     emit_progress(app, "connecting");
     let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false);
@@ -372,8 +414,40 @@ async fn run_sync(
     device.initialize().await?;
 
     emit_progress(app, "downloading");
-    let should_exit = Arc::new(AtomicBool::new(false));
-    device.sync_history(should_exit).await?;
+
+    // Spawn a parallel task that polls the heart_rate row count every 3s and
+    // emits progress events so the UI can show "Downloading… N readings".
+    let progress_app = app.clone();
+    let progress_db = db.clone();
+    let progress_baseline = before;
+    let progress_task = tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if let Ok(count) = heart_rate::Entity::find()
+                .count(progress_db.connection())
+                .await
+            {
+                let new = (count as usize).saturating_sub(progress_baseline);
+                let _ = progress_app.emit("sync:download_progress", new);
+            }
+        }
+    });
+
+    let sync_result = device.sync_history(cancel.clone()).await;
+    progress_task.abort();
+    sync_result?;
+
+    if cancel.load(Ordering::SeqCst) {
+        timeout_task.abort();
+        if start.elapsed() >= SYNC_TIMEOUT {
+            anyhow::bail!(
+                "Sync timed out after {} seconds — strap may be out of range or unresponsive",
+                start.elapsed().as_secs()
+            );
+        }
+        anyhow::bail!("Sync cancelled");
+    }
+    timeout_task.abort();
 
     // Battery + wrist/charging state via the custom command protocol. Uses
     // GetBatteryLevel (26) and GetHelloHarvard (35). Failures are non-fatal.
@@ -492,8 +566,10 @@ async fn build_snapshot(
     db: &DatabaseHandler,
     battery: Option<BatteryInfo>,
     last_sync_at: Option<NaiveDateTime>,
+    last_sync_attempt_at: Option<NaiveDateTime>,
     next_sync_at: Option<NaiveDateTime>,
     sync_in_progress: bool,
+    strap_seen_at: Option<NaiveDateTime>,
 ) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
     let today = now.date();
@@ -523,8 +599,10 @@ async fn build_snapshot(
         recent_activities: build_activity_list(&recent_activities),
         battery,
         last_sync_at,
+        last_sync_attempt_at,
         next_sync_at,
         sync_in_progress,
+        strap_seen_at,
     })
 }
 
@@ -719,19 +797,18 @@ async fn scheduler_loop(app: AppHandle) {
             continue;
         }
 
-        // Decide when the next sync should run.
+        // Decide when the next sync should run. Use last_sync_attempt_at
+        // (not last_sync_at) so failed attempts still advance the schedule
+        // and we don't spin trying to reach a strap that's out of range.
         let now = Local::now().naive_local();
-        let last = *state.last_sync_at.read().await;
-        let next = match (last, interval_mins) {
-            // Never synced this session, and we have a device: sync immediately.
+        let last_attempt = *state.last_sync_attempt_at.read().await;
+        let next = match (last_attempt, interval_mins) {
             (None, _) => now,
-            // Manual-only mode with a prior sync: wait for a notify.
             (Some(_), 0) => {
                 *state.next_sync_at.write().await = None;
                 state.scheduler_notify.notified().await;
                 continue;
             }
-            // Scheduled mode: base the next run off the last sync time.
             (Some(t), mins) => t + TimeDelta::minutes(mins as i64),
         };
         *state.next_sync_at.write().await = Some(next);
@@ -762,10 +839,107 @@ async fn run_scheduled_sync(app: &AppHandle) {
         Err(e) => {
             eprintln!("scheduled sync failed: {}", e);
             let _ = app.emit("sync:error", e.to_string());
-            // Brief back-off so we don't hammer a failing strap.
-            tokio::time::sleep(Duration::from_secs(180)).await;
         }
     }
+}
+
+/// Lightweight presence detector. Every 2 minutes, does a 5-second BLE scan
+/// for the configured device. Updates strap_seen_at on hit. When the strap
+/// transitions from absent → present, triggers an immediate sync so users
+/// who left and came back don't have to wait for the next scheduled tick.
+async fn presence_loop(app: AppHandle) {
+    let mut last_seen = false;
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        let state = app.state::<AppState>();
+
+        // Skip if a sync is in flight — it'll update strap_seen_at itself.
+        if *state.sync_in_progress.read().await {
+            continue;
+        }
+
+        let device_name = {
+            let cfg = state.config.read().await;
+            cfg.device_name.clone()
+        };
+        let Some(device_name) = device_name else {
+            continue;
+        };
+
+        // try_lock so we never hold the BLE adapter away from a sync request.
+        let in_range = {
+            let Ok(_guard) = state.ble_lock.clone().try_lock_owned() else {
+                continue;
+            };
+            quick_presence_scan(&device_name).await
+        };
+
+        if in_range {
+            *state.strap_seen_at.write().await = Some(Local::now().naive_local());
+        }
+
+        // Strap just came back into range: kick off a sync.
+        if in_range && !last_seen {
+            eprintln!("openwhoop-tray: strap returned to range, triggering sync");
+            let app_clone = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match do_sync_guarded(app_clone.clone()).await {
+                    Ok(report) => {
+                        let _ = app_clone.emit("sync:complete", report);
+                    }
+                    Err(e) => {
+                        let _ = app_clone.emit("sync:error", e.to_string());
+                    }
+                }
+            });
+        }
+        last_seen = in_range;
+    }
+}
+
+async fn quick_presence_scan(device_name: &str) -> bool {
+    let Ok(manager) = Manager::new().await else {
+        return false;
+    };
+    let Ok(adapters) = manager.adapters().await else {
+        return false;
+    };
+    let Some(adapter) = adapters.into_iter().next() else {
+        return false;
+    };
+    if adapter
+        .start_scan(ScanFilter {
+            services: vec![WHOOP_SERVICE],
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(peripherals) = adapter.peripherals().await {
+            for p in peripherals {
+                if let Ok(Some(props)) = p.properties().await {
+                    if !props.services.contains(&WHOOP_SERVICE) {
+                        continue;
+                    }
+                    if let Some(name) = props.local_name {
+                        if sanitize_name(&name).starts_with(device_name) {
+                            let _ = adapter.stop_scan().await;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let _ = adapter.stop_scan().await;
+    false
 }
 
 // ---------------------------------------------------------------- run
@@ -786,8 +960,12 @@ pub fn run() {
             battery: RwLock::new(None),
             sync_in_progress: RwLock::new(false),
             last_sync_at: RwLock::new(None),
+            last_sync_attempt_at: RwLock::new(None),
             next_sync_at: RwLock::new(None),
             scheduler_notify: Arc::new(Notify::new()),
+            sync_cancel: Arc::new(AtomicBool::new(false)),
+            strap_seen_at: RwLock::new(None),
+            ble_lock: Arc::new(Mutex::new(())),
         })
         .setup(|app| {
             // Config path: ~/Library/Application Support/dev.brennen.openwhoop-tray/config.json
@@ -872,11 +1050,20 @@ pub fn run() {
                 scheduler_loop(scheduler_handle).await;
             });
 
+            // Presence ping loop — quick BLE scan every 2 minutes so the
+            // UI can show whether the strap is currently in range, and so
+            // we auto-sync when the user comes back into range.
+            let presence_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                presence_loop(presence_handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             sync_now,
+            cancel_sync,
             get_config,
             set_device_name,
             set_sync_interval,

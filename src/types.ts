@@ -6,8 +6,10 @@ export type Snapshot = {
   recent_activities: ActivitySummary[];
   battery: BatteryInfo | null;
   last_sync_at: string | null;
+  last_sync_attempt_at: string | null;
   next_sync_at: string | null;
   sync_in_progress: boolean;
+  strap_seen_at: string | null;
 };
 
 export type DiscoveredDevice = {
