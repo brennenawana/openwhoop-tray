@@ -15,8 +15,8 @@ use openwhoop_types::activities::{ActivityPeriod, ActivityType, SearchActivityPe
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Emitter, Manager as _, State,
-    menu::{Menu, MenuItem},
+    AppHandle, Emitter, Manager as _, State, Wry,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
@@ -954,6 +954,101 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn format_tray_status(
+    syncing: bool,
+    battery: Option<BatteryInfo>,
+    strap_seen: Option<NaiveDateTime>,
+    last_sync: Option<NaiveDateTime>,
+    next_sync: Option<NaiveDateTime>,
+) -> (String, String) {
+    if syncing {
+        return (
+            "Syncing…".to_string(),
+            "OpenWhoop\nSyncing with strap…".to_string(),
+        );
+    }
+
+    let now = Local::now().naive_local();
+
+    if battery.is_none() && strap_seen.is_none() && last_sync.is_none() {
+        return (
+            "No data yet".to_string(),
+            "OpenWhoop\nWaiting for first sync".to_string(),
+        );
+    }
+
+    fn relative_mins(from: NaiveDateTime, to: NaiveDateTime) -> String {
+        let mins = (to - from).num_minutes().max(0);
+        if mins < 1 {
+            "just now".to_string()
+        } else if mins < 60 {
+            format!("{}m ago", mins)
+        } else {
+            format!("{}h ago", mins / 60)
+        }
+    }
+
+    let battery_str = battery
+        .map(|b| format!("{:.1}%{}", b.percent, if b.charging { " ⚡" } else { "" }))
+        .unwrap_or_else(|| "— battery".to_string());
+
+    let presence_str = match strap_seen {
+        Some(t) if (now - t).num_minutes() < 5 => "in range".to_string(),
+        Some(t) => format!("seen {}", relative_mins(t, now)),
+        None => "not detected".to_string(),
+    };
+
+    let sync_str = last_sync
+        .map(|t| relative_mins(t, now))
+        .unwrap_or_else(|| "never".to_string());
+
+    let menu_text = format!("{} · {} · synced {}", battery_str, presence_str, sync_str);
+
+    let mut tooltip = String::from("OpenWhoop\n");
+    if let Some(b) = battery {
+        tooltip.push_str(&format!(
+            "Battery: {:.1}%{}\nOn wrist: {}\n",
+            b.percent,
+            if b.charging { " (charging)" } else { "" },
+            if b.is_worn { "yes" } else { "no" }
+        ));
+    }
+    tooltip.push_str(&format!("Strap: {}\n", presence_str));
+    tooltip.push_str(&format!("Last sync: {}", sync_str));
+    if let Some(t) = next_sync {
+        let mins = (t - now).num_minutes();
+        if mins > 0 {
+            tooltip.push_str(&format!("\nNext sync: in {}m", mins));
+        }
+    }
+
+    (menu_text, tooltip)
+}
+
+async fn update_tray_status(app: &AppHandle, status_item: &MenuItem<Wry>) {
+    let state = app.state::<AppState>();
+    let syncing = *state.sync_in_progress.read().await;
+    let battery = *state.battery.read().await;
+    let strap_seen = *state.strap_seen_at.read().await;
+    let last_sync = *state.last_sync_at.read().await;
+    let next_sync = *state.next_sync_at.read().await;
+
+    let (menu_text, tooltip) =
+        format_tray_status(syncing, battery, strap_seen, last_sync, next_sync);
+
+    let _ = status_item.set_text(menu_text);
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
+async fn tray_update_loop(app: AppHandle, status_item: MenuItem<Wry>) {
+    loop {
+        update_tray_status(&app, &status_item).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 fn trigger_sync_from_tray(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1206,14 +1301,19 @@ pub fn run() {
             }
 
             // Tray icon
+            let status_item =
+                MenuItem::with_id(app, "status", "Loading…", false, None::<&str>)?;
+            let separator = PredefinedMenuItem::separator(app)?;
             let show_item =
                 MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
             let sync_item =
                 MenuItem::with_id(app, "sync", "Sync Now", true, None::<&str>)?;
             let quit_item =
                 MenuItem::with_id(app, "quit", "Quit OpenWhoop", true, None::<&str>)?;
-            let menu =
-                Menu::with_items(app, &[&show_item, &sync_item, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[&status_item, &separator, &show_item, &sync_item, &quit_item],
+            )?;
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
@@ -1253,6 +1353,15 @@ pub fn run() {
             let presence_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 presence_loop(presence_handle).await;
+            });
+
+            // Tray status updater — refreshes the first menu item and the
+            // tray tooltip every 10s so the user can check battery /
+            // presence / last sync without opening the window.
+            let tray_handle = app.handle().clone();
+            let tray_status_clone = status_item.clone();
+            tauri::async_runtime::spawn(async move {
+                tray_update_loop(tray_handle, tray_status_clone).await;
             });
 
             Ok(())
