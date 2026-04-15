@@ -63,6 +63,7 @@ struct AppState {
     next_sync_at: RwLock<Option<NaiveDateTime>>,
     scheduler_notify: Arc<Notify>,
     sync_cancel: Arc<AtomicBool>,
+    sync_cancel_reason: Arc<RwLock<Option<CancelReason>>>,
     strap_seen_at: RwLock<Option<NaiveDateTime>>,
     ble_lock: Arc<Mutex<()>>,
 }
@@ -73,6 +74,13 @@ struct BatteryInfo {
     charging: bool,
     is_worn: bool,
     updated_at: NaiveDateTime,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CancelReason {
+    User,
+    HardTimeout,
+    NoProgress,
 }
 
 // ---------------------------------------------------------------- snapshot types
@@ -203,6 +211,7 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
 
 #[tauri::command]
 async fn cancel_sync(state: State<'_, AppState>) -> Result<(), String> {
+    *state.sync_cancel_reason.write().await = Some(CancelReason::User);
     state.sync_cancel.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -337,6 +346,7 @@ async fn do_sync_guarded(app: AppHandle) -> anyhow::Result<SyncReport> {
         *flag = true;
     }
     state.sync_cancel.store(false, Ordering::SeqCst);
+    *state.sync_cancel_reason.write().await = None;
     *state.last_sync_attempt_at.write().await = Some(Local::now().naive_local());
 
     // Wait for any in-flight presence ping to release the BLE adapter,
@@ -385,14 +395,18 @@ async fn run_sync(
     let start = Instant::now();
     let before = heart_rate::Entity::find().count(db.connection()).await? as usize;
 
-    let cancel = app.state::<AppState>().sync_cancel.clone();
+    let state_arc = app.state::<AppState>();
+    let cancel = state_arc.sync_cancel.clone();
+    let cancel_reason = state_arc.sync_cancel_reason.clone();
 
     // Hard timeout: a parallel task flips the cancel flag after SYNC_TIMEOUT.
     // sync_history checks the flag at the top of each iteration, so it will
     // unwind cleanly. Aborted on success.
     let timeout_cancel = cancel.clone();
+    let timeout_reason = cancel_reason.clone();
     let timeout_task = tauri::async_runtime::spawn(async move {
         tokio::time::sleep(SYNC_TIMEOUT).await;
+        *timeout_reason.write().await = Some(CancelReason::HardTimeout);
         timeout_cancel.store(true, Ordering::SeqCst);
     });
 
@@ -417,37 +431,67 @@ async fn run_sync(
 
     // Spawn a parallel task that polls the heart_rate row count every 3s and
     // emits progress events so the UI can show "Downloading… N readings".
+    // Doubles as a stall detector: if the count hasn't advanced for 30s after
+    // we've already received at least one packet, fire the cancel flag with
+    // a NoProgress reason so the user gets a friendly recovery message
+    // instead of waiting out the 5-minute hard timeout.
     let progress_app = app.clone();
     let progress_db = db.clone();
     let progress_baseline = before;
+    let progress_cancel = cancel.clone();
+    let progress_reason = cancel_reason.clone();
     let progress_task = tauri::async_runtime::spawn(async move {
+        const STALL_THRESHOLD: Duration = Duration::from_secs(30);
+        let mut last_count = progress_baseline;
+        let mut last_progress_at = Instant::now();
+        let mut received_any = false;
+
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            if let Ok(count) = heart_rate::Entity::find()
+            let Ok(count) = heart_rate::Entity::find()
                 .count(progress_db.connection())
                 .await
-            {
-                let new = (count as usize).saturating_sub(progress_baseline);
-                let _ = progress_app.emit("sync:download_progress", new);
+            else {
+                continue;
+            };
+            let count = count as usize;
+            let new = count.saturating_sub(progress_baseline);
+            let _ = progress_app.emit("sync:download_progress", new);
+
+            if count > last_count {
+                last_count = count;
+                last_progress_at = Instant::now();
+                received_any = true;
+            } else if received_any && last_progress_at.elapsed() >= STALL_THRESHOLD {
+                eprintln!(
+                    "openwhoop-tray: download stalled ({}s), cancelling",
+                    last_progress_at.elapsed().as_secs()
+                );
+                *progress_reason.write().await = Some(CancelReason::NoProgress);
+                progress_cancel.store(true, Ordering::SeqCst);
+                break;
             }
         }
     });
 
     let sync_result = device.sync_history(cancel.clone()).await;
     progress_task.abort();
+    timeout_task.abort();
     sync_result?;
 
     if cancel.load(Ordering::SeqCst) {
-        timeout_task.abort();
-        if start.elapsed() >= SYNC_TIMEOUT {
-            anyhow::bail!(
+        let reason = *cancel_reason.read().await;
+        match reason {
+            Some(CancelReason::HardTimeout) => anyhow::bail!(
                 "Sync timed out after {} seconds — strap may be out of range or unresponsive",
                 start.elapsed().as_secs()
-            );
+            ),
+            Some(CancelReason::NoProgress) => anyhow::bail!(
+                "Strap stopped sending data after 30 seconds of inactivity — try again or reboot the strap"
+            ),
+            Some(CancelReason::User) | None => anyhow::bail!("Sync cancelled"),
         }
-        anyhow::bail!("Sync cancelled");
     }
-    timeout_task.abort();
 
     // Battery + wrist/charging state via the custom command protocol. Uses
     // GetBatteryLevel (26) and GetHelloHarvard (35). Failures are non-fatal.
@@ -964,6 +1008,7 @@ pub fn run() {
             next_sync_at: RwLock::new(None),
             scheduler_notify: Arc::new(Notify::new()),
             sync_cancel: Arc::new(AtomicBool::new(false)),
+            sync_cancel_reason: Arc::new(RwLock::new(None)),
             strap_seen_at: RwLock::new(None),
             ble_lock: Arc::new(Mutex::new(())),
         })
