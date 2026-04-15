@@ -30,6 +30,18 @@ struct Config {
     /// Minutes between automatic syncs. None or 0 = manual only.
     #[serde(default)]
     sync_interval_minutes: Option<u32>,
+    /// Minutes between presence scans. None = default (2), Some(0) = off.
+    #[serde(default)]
+    presence_interval_minutes: Option<u32>,
+}
+
+/// Returns Some(minutes) if presence scans are enabled, None if disabled.
+fn effective_presence_minutes(cfg: &Config) -> Option<u32> {
+    match cfg.presence_interval_minutes {
+        None => Some(2),
+        Some(0) => None,
+        Some(n) => Some(n),
+    }
 }
 
 impl Config {
@@ -62,6 +74,7 @@ struct AppState {
     last_sync_attempt_at: RwLock<Option<NaiveDateTime>>,
     next_sync_at: RwLock<Option<NaiveDateTime>>,
     scheduler_notify: Arc<Notify>,
+    presence_notify: Arc<Notify>,
     sync_cancel: Arc<AtomicBool>,
     sync_cancel_reason: Arc<RwLock<Option<CancelReason>>>,
     strap_seen_at: RwLock<Option<NaiveDateTime>>,
@@ -414,6 +427,26 @@ async fn set_sync_interval(
         cfg.save(&path).map_err(|e| e.to_string())?;
     }
     state.scheduler_notify.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_presence_interval(
+    state: State<'_, AppState>,
+    minutes: Option<u32>,
+) -> Result<(), String> {
+    let path = state
+        .config_path
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "config path not initialized".to_string())?;
+    {
+        let mut cfg = state.config.write().await;
+        cfg.presence_interval_minutes = minutes;
+        cfg.save(&path).map_err(|e| e.to_string())?;
+    }
+    state.presence_notify.notify_one();
     Ok(())
 }
 
@@ -1132,15 +1165,29 @@ async fn run_scheduled_sync(app: &AppHandle) {
     }
 }
 
-/// Lightweight presence detector. Every 2 minutes, does a 5-second BLE scan
-/// for the configured device. Updates strap_seen_at on hit. When the strap
-/// transitions from absent → present, triggers an immediate sync so users
-/// who left and came back don't have to wait for the next scheduled tick.
+/// Lightweight presence detector. Reads the configured presence interval
+/// from app config and sleeps that long between 5-second BLE scans. Updates
+/// strap_seen_at on hit, and triggers an immediate sync on absent→present
+/// transitions so the user doesn't have to wait for the next scheduled tick.
 async fn presence_loop(app: AppHandle) {
     let mut last_seen = false;
 
     loop {
-        tokio::time::sleep(Duration::from_secs(120)).await;
+        let state = app.state::<AppState>();
+        let interval = effective_presence_minutes(&*state.config.read().await);
+        let notify = state.presence_notify.clone();
+
+        let Some(minutes) = interval else {
+            // Disabled — wait for a settings change.
+            notify.notified().await;
+            continue;
+        };
+
+        // Sleep for the interval, but wake early if settings change.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(u64::from(minutes) * 60)) => {}
+            _ = notify.notified() => { continue; }
+        }
 
         let state = app.state::<AppState>();
 
@@ -1252,6 +1299,7 @@ pub fn run() {
             last_sync_attempt_at: RwLock::new(None),
             next_sync_at: RwLock::new(None),
             scheduler_notify: Arc::new(Notify::new()),
+            presence_notify: Arc::new(Notify::new()),
             sync_cancel: Arc::new(AtomicBool::new(false)),
             sync_cancel_reason: Arc::new(RwLock::new(None)),
             strap_seen_at: RwLock::new(None),
@@ -1360,6 +1408,7 @@ pub fn run() {
             get_config,
             set_device_name,
             set_sync_interval,
+            set_presence_interval,
             scan_devices,
             get_autostart,
             set_autostart,

@@ -18,6 +18,12 @@ export type AlarmStatus = {
   at: string | null;
 };
 
+export type BackendConfig = {
+  device_name: string | null;
+  sync_interval_minutes: number | null;
+  presence_interval_minutes: number | null;
+};
+
 export type DiscoveredDevice = {
   name: string;
   rssi: number | null;

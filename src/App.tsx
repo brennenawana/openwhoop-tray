@@ -55,6 +55,14 @@ const INTERVAL_OPTIONS: { label: string; minutes: number }[] = [
   { label: "Daily", minutes: 1440 },
 ];
 
+const PRESENCE_OPTIONS: { label: string; minutes: number }[] = [
+  { label: "Off", minutes: 0 },
+  { label: "Every 1 minute", minutes: 1 },
+  { label: "Every 2 minutes", minutes: 2 },
+  { label: "Every 5 minutes", minutes: 5 },
+  { label: "Every 10 minutes", minutes: 10 },
+];
+
 type ClassifiedError = {
   message: string;
   hint: string | null;
@@ -295,6 +303,7 @@ type SyncReport = {
 type BackendConfig = {
   device_name: string | null;
   sync_interval_minutes: number | null;
+  presence_interval_minutes: number | null;
 };
 
 function App() {
@@ -309,6 +318,7 @@ function App() {
   const [deviceName, setDeviceName] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [syncInterval, setSyncInterval] = useState<number>(0);
+  const [presenceInterval, setPresenceInterval] = useState<number>(2);
   const [autostart, setAutostart] = useState<boolean>(false);
   const [scanning, setScanning] = useState<boolean>(false);
   const [scanResults, setScanResults] = useState<DiscoveredDevice[]>([]);
@@ -345,6 +355,15 @@ function App() {
       await invoke("set_sync_interval", {
         minutes: minutes === 0 ? null : minutes,
       });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const savePresenceInterval = async (minutes: number) => {
+    setPresenceInterval(minutes);
+    try {
+      await invoke("set_presence_interval", { minutes });
     } catch (e) {
       setError(String(e));
     }
@@ -393,6 +412,7 @@ function App() {
         const name = cfg.device_name ?? "";
         setDeviceName(name);
         setSyncInterval(cfg.sync_interval_minutes ?? 0);
+        setPresenceInterval(cfg.presence_interval_minutes ?? 2);
         if (!name) setShowSettings(true);
       } catch (e) {
         setError(String(e));
@@ -708,6 +728,27 @@ function App() {
                 </option>
               ))}
             </select>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <label className="text-[10px] uppercase tracking-wider text-zinc-500">
+              Presence scan
+            </label>
+            <select
+              value={presenceInterval}
+              onChange={(e) => savePresenceInterval(Number(e.target.value))}
+              className="rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600"
+            >
+              {PRESENCE_OPTIONS.map((opt) => (
+                <option key={opt.minutes} value={opt.minutes}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-[10px] text-zinc-600">
+              Quick BLE scan to detect when the strap is nearby. Auto-syncs
+              when it comes back in range.
+            </p>
           </div>
 
           <label className="flex items-center justify-between cursor-pointer">
