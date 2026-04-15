@@ -246,8 +246,9 @@ function App() {
   const [scanning, setScanning] = useState<boolean>(false);
   const [scanResults, setScanResults] = useState<DiscoveredDevice[]>([]);
   const [downloadCount, setDownloadCount] = useState<number>(0);
-  const [alarmInput, setAlarmInput] = useState<string>("");
+  const [alarmInput, setAlarmInput] = useState<string>("07:00");
   const [alarmBusy, setAlarmBusy] = useState<boolean>(false);
+  const [alarmInputTouched, setAlarmInputTouched] = useState<boolean>(false);
   const [tick, setTick] = useState(0);
   // tick increments every 30s so the "Next sync in Xm" label re-renders
   useEffect(() => {
@@ -394,6 +395,18 @@ function App() {
     const t = setTimeout(() => setLastSync(null), 8000);
     return () => clearTimeout(t);
   }, [lastSync]);
+
+  // Mirror the strap's current alarm into the picker, but only if the user
+  // hasn't typed anything yet — otherwise edits get clobbered every refresh.
+  useEffect(() => {
+    if (alarmInputTouched) return;
+    if (snapshot?.alarm?.enabled && snapshot.alarm.at) {
+      const d = new Date(snapshot.alarm.at);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      setAlarmInput(`${hh}:${mm}`);
+    }
+  }, [snapshot?.alarm, alarmInputTouched]);
 
   // ---------- Alarm helpers ----------
 
@@ -655,7 +668,10 @@ function App() {
               <input
                 type="time"
                 value={alarmInput}
-                onChange={(e) => setAlarmInput(e.target.value)}
+                onChange={(e) => {
+                  setAlarmInput(e.target.value);
+                  setAlarmInputTouched(true);
+                }}
                 className="flex-1 rounded border border-zinc-800 bg-black/40 px-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-600 [color-scheme:dark]"
               />
               <button
