@@ -129,6 +129,43 @@ function Section({
   );
 }
 
+function BatteryPill({
+  percent,
+  charging,
+}: {
+  percent: number;
+  charging: boolean;
+}) {
+  const color =
+    charging
+      ? "bg-sky-400"
+      : percent > 50
+      ? "bg-emerald-400"
+      : percent > 20
+      ? "bg-amber-400"
+      : "bg-rose-400";
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-zinc-800 px-2 py-0.5 text-[9px] font-normal text-zinc-400 tabular-nums">
+      <span className={`w-1 h-1 rounded-full ${color}`} />
+      {percent.toFixed(1)}%
+      {charging && <span className="text-sky-400">⚡</span>}
+    </span>
+  );
+}
+
+function WristPill({ isWorn }: { isWorn: boolean }) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-zinc-800 px-2 py-0.5 text-[9px] font-normal text-zinc-400">
+      <span
+        className={`w-1 h-1 rounded-full ${
+          isWorn ? "bg-emerald-400" : "bg-zinc-600"
+        }`}
+      />
+      {isWorn ? "on wrist" : "off wrist"}
+    </span>
+  );
+}
+
 type TempUnit = "C" | "F";
 
 function cToF(c: number): number {
@@ -257,7 +294,18 @@ function App() {
     <main className="flex flex-col h-screen overflow-y-auto px-6 py-5 gap-6 text-zinc-100">
       <header className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-semibold tracking-tight">OpenWhoop</h1>
+          <h1 className="text-lg font-semibold tracking-tight flex items-center gap-1.5 flex-wrap">
+            OpenWhoop
+            {snapshot?.battery && (
+              <>
+                <BatteryPill
+                  percent={snapshot.battery.percent}
+                  charging={snapshot.battery.charging}
+                />
+                <WristPill isWorn={snapshot.battery.is_worn} />
+              </>
+            )}
+          </h1>
           <p className="text-xs text-zinc-500">
             {syncing && syncStage
               ? STAGE_LABEL[syncStage]

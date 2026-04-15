@@ -52,6 +52,15 @@ struct AppState {
     db_path: RwLock<Option<String>>,
     config: RwLock<Config>,
     config_path: RwLock<Option<PathBuf>>,
+    battery: RwLock<Option<BatteryInfo>>,
+}
+
+#[derive(Serialize, Clone, Copy)]
+struct BatteryInfo {
+    percent: f32,
+    charging: bool,
+    is_worn: bool,
+    updated_at: NaiveDateTime,
 }
 
 // ---------------------------------------------------------------- snapshot types
@@ -63,6 +72,7 @@ struct Snapshot {
     latest_sleep: Option<SleepSection>,
     week: WeekSection,
     recent_activities: Vec<ActivitySummary>,
+    battery: Option<BatteryInfo>,
 }
 
 #[derive(Serialize, Clone)]
@@ -119,6 +129,7 @@ struct SyncReport {
     total_readings: usize,
     sleep_nights: usize,
     activities: usize,
+    battery: Option<BatteryInfo>,
 }
 
 // ---------------------------------------------------------------- helpers
@@ -148,7 +159,8 @@ async fn ensure_db_from_handle(app: &AppHandle) -> Result<Arc<DatabaseHandler>, 
 #[tauri::command]
 async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let db = ensure_db(&state).await?;
-    build_snapshot(&db).await.map_err(|e| e.to_string())
+    let battery = *state.battery.read().await;
+    build_snapshot(&db, battery).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -230,6 +242,20 @@ async fn run_sync(
     let should_exit = Arc::new(AtomicBool::new(false));
     device.sync_history(should_exit).await?;
 
+    // Battery + wrist/charging state via the custom command protocol. Uses
+    // GetBatteryLevel (26) and GetHelloHarvard (35). Failures are non-fatal.
+    let battery = match read_device_status(&mut device).await {
+        Ok(info) => {
+            let state = app.state::<AppState>();
+            *state.battery.write().await = Some(info);
+            Some(info)
+        }
+        Err(e) => {
+            eprintln!("device status read failed: {}", e);
+            None
+        }
+    };
+
     if device.is_connected().await.unwrap_or(false) {
         let _ = device
             .send_command(WhoopPacket::exit_high_freq_sync())
@@ -257,6 +283,7 @@ async fn run_sync(
         total_readings: after,
         sleep_nights,
         activities,
+        battery,
     };
 
     emit_progress(app, "done");
@@ -311,9 +338,27 @@ fn sanitize_name(name: &str) -> String {
         .to_string()
 }
 
+/// Query battery level + wrist/charging state via the custom WHOOP command
+/// protocol (GetBatteryLevel and GetHelloHarvard), not the standard BLE
+/// Battery Service — that characteristic exists on the strap but returns a
+/// stale value.
+async fn read_device_status(device: &mut WhoopDevice) -> anyhow::Result<BatteryInfo> {
+    let percent = device.get_battery().await?;
+    let (charging, is_worn) = device.get_hello().await?;
+    Ok(BatteryInfo {
+        percent,
+        charging,
+        is_worn,
+        updated_at: Local::now().naive_local(),
+    })
+}
+
 // ---------------------------------------------------------------- snapshot build
 
-async fn build_snapshot(db: &DatabaseHandler) -> anyhow::Result<Snapshot> {
+async fn build_snapshot(
+    db: &DatabaseHandler,
+    battery: Option<BatteryInfo>,
+) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
     let today = now.date();
     let day_start = today.and_hms_opt(0, 0, 0).unwrap();
@@ -340,6 +385,7 @@ async fn build_snapshot(db: &DatabaseHandler) -> anyhow::Result<Snapshot> {
         latest_sleep: sleep_cycles.last().map(build_sleep_section),
         week: build_week(&sleep_cycles, &recent_activities, week_start)?,
         recent_activities: build_activity_list(&recent_activities),
+        battery,
     })
 }
 
@@ -521,6 +567,7 @@ pub fn run() {
             db_path: RwLock::new(None),
             config: RwLock::new(Config::default()),
             config_path: RwLock::new(None),
+            battery: RwLock::new(None),
         })
         .setup(|app| {
             // Config path: ~/Library/Application Support/dev.brennen.openwhoop-tray/config.json

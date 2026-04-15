@@ -4,6 +4,14 @@ export type Snapshot = {
   latest_sleep: SleepSection | null;
   week: WeekSection;
   recent_activities: ActivitySummary[];
+  battery: BatteryInfo | null;
+};
+
+export type BatteryInfo = {
+  percent: number;
+  charging: boolean;
+  is_worn: boolean;
+  updated_at: string;
 };
 
 export type TodaySection = {
