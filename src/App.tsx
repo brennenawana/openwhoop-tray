@@ -386,6 +386,13 @@ function App() {
     }
   };
 
+  // Auto-dismiss the success toast after 8s.
+  useEffect(() => {
+    if (!lastSync) return;
+    const t = setTimeout(() => setLastSync(null), 8000);
+    return () => clearTimeout(t);
+  }, [lastSync]);
+
   const onSync = async () => {
     if (!deviceName.trim()) {
       setShowSettings(true);
@@ -558,11 +565,20 @@ function App() {
       )}
 
       {lastSync && !syncing && (
-        <div className="rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
-          Synced in {lastSync.duration_secs.toFixed(1)}s · +
-          {lastSync.new_readings} new readings · {lastSync.total_readings}{" "}
-          total · {lastSync.sleep_nights} sleep nights ·{" "}
-          {lastSync.activities} activities
+        <div className="flex items-start gap-2 rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
+          <span className="flex-1">
+            Synced in {lastSync.duration_secs.toFixed(1)}s · +
+            {lastSync.new_readings} new readings · {lastSync.total_readings}{" "}
+            total · {lastSync.sleep_nights} sleep nights ·{" "}
+            {lastSync.activities} activities
+          </span>
+          <button
+            onClick={() => setLastSync(null)}
+            className="text-emerald-400/60 hover:text-emerald-300 leading-none"
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
 
