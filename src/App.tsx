@@ -444,6 +444,11 @@ function App() {
           setDownloadCount(0);
         })
       );
+      unlistenFns.push(
+        await listen("alarm:updated", () => {
+          refresh();
+        })
+      );
     })();
     return () => unlistenFns.forEach((fn) => fn());
   }, [refresh]);

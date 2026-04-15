@@ -361,6 +361,7 @@ async fn do_alarm_op(app: AppHandle, op: AlarmOp) -> anyhow::Result<AlarmStatus>
 
     *state.alarm.write().await = Some(status);
     *state.strap_seen_at.write().await = Some(Local::now().naive_local());
+    let _ = app.emit("alarm:updated", status);
 
     Ok(status)
 }
@@ -1125,6 +1126,18 @@ async fn run_scheduled_sync(app: &AppHandle) {
     match do_sync_guarded(app.clone()).await {
         Ok(report) => {
             let _ = app.emit("sync:complete", report);
+
+            // First sync of the session: also fetch alarm state so the
+            // settings panel doesn't show "Status unknown" on first open.
+            let state = app.state::<AppState>();
+            if state.alarm.read().await.is_none() {
+                let app_clone = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = do_alarm_op(app_clone, AlarmOp::Read).await {
+                        eprintln!("startup alarm fetch failed: {}", e);
+                    }
+                });
+            }
         }
         Err(e) => {
             eprintln!("scheduled sync failed: {}", e);
