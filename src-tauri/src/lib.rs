@@ -1278,12 +1278,16 @@ async fn scheduler_loop(app: AppHandle) {
 }
 
 async fn run_scheduled_sync(app: &AppHandle) {
+    // Skip silently if another sync is already running — don't spam the
+    // user with "already in progress" errors from the scheduler.
+    if *app.state::<AppState>().sync_in_progress.read().await {
+        return;
+    }
+
     match do_sync_guarded(app.clone()).await {
         Ok(report) => {
             let _ = app.emit("sync:complete", report);
 
-            // First sync of the session: also fetch alarm state so the
-            // settings panel doesn't show "Status unknown" on first open.
             let state = app.state::<AppState>();
             if state.alarm.read().await.is_none() {
                 let app_clone = app.clone();
@@ -1353,7 +1357,7 @@ async fn presence_loop(app: AppHandle) {
         }
 
         // Strap just came back into range: kick off a sync.
-        if in_range && !last_seen {
+        if in_range && !last_seen && !*state.sync_in_progress.read().await {
             eprintln!("openwhoop-tray: strap returned to range, triggering sync");
             let app_clone = app.clone();
             tauri::async_runtime::spawn(async move {
