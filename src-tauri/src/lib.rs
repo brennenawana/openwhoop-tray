@@ -10,9 +10,12 @@ use openwhoop::{OpenWhoop, WhoopDevice};
 use openwhoop_algos::{SleepConsistencyAnalyzer, SleepCycle};
 use openwhoop_codec::{WhoopData, WhoopPacket, constants::WHOOP_SERVICE};
 use openwhoop_db::DatabaseHandler;
-use openwhoop_entities::heart_rate;
+use openwhoop_entities::{battery_log, heart_rate};
 use openwhoop_types::activities::{ActivityPeriod, ActivityType, SearchActivityPeriods};
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    ActiveValue::NotSet, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager as _, State, Wry,
@@ -90,6 +93,14 @@ struct BatteryInfo {
     updated_at: NaiveDateTime,
 }
 
+#[derive(Serialize, Clone, Copy)]
+struct BatteryEstimate {
+    hours_remaining: f64,
+    drain_rate_pct_per_hour: f64,
+    data_points: usize,
+    confidence: &'static str,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CancelReason {
     User,
@@ -120,6 +131,7 @@ struct Snapshot {
     sync_in_progress: bool,
     strap_seen_at: Option<NaiveDateTime>,
     alarm: Option<AlarmStatus>,
+    battery_estimate: Option<BatteryEstimate>,
 }
 
 #[derive(Serialize, Clone)]
@@ -219,6 +231,10 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let sync_in_progress = *state.sync_in_progress.read().await;
     let strap_seen_at = *state.strap_seen_at.read().await;
     let alarm = *state.alarm.read().await;
+    let battery_estimate = match battery {
+        Some(b) if !b.charging => estimate_battery_remaining(&db, b.percent).await,
+        _ => None,
+    };
     build_snapshot(
         &db,
         battery,
@@ -228,6 +244,7 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         sync_in_progress,
         strap_seen_at,
         alarm,
+        battery_estimate,
     )
     .await
     .map_err(|e| e.to_string())
@@ -259,6 +276,106 @@ async fn clear_alarm(app: AppHandle) -> Result<AlarmStatus, String> {
 #[tauri::command]
 async fn ring_strap(app: AppHandle) -> Result<(), String> {
     do_ring_strap(app).await.map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------- battery prediction
+
+async fn log_battery_reading(
+    db: &DatabaseHandler,
+    info: &BatteryInfo,
+    avg_bpm: Option<i16>,
+) {
+    let model = battery_log::ActiveModel {
+        id: NotSet,
+        time: Set(info.updated_at),
+        percent: Set(f64::from(info.percent)),
+        charging: Set(info.charging),
+        is_worn: Set(info.is_worn),
+        avg_bpm: Set(avg_bpm),
+    };
+    let _ = battery_log::Entity::insert(model)
+        .exec(db.connection())
+        .await;
+}
+
+/// Estimate hours remaining from the battery_log table. Uses non-charging,
+/// decreasing readings from the current discharge session (everything since
+/// the last charging=true row). Returns None if there aren't at least 2
+/// data points or if the drain rate is ≤ 0 (stale/charging).
+async fn estimate_battery_remaining(
+    db: &DatabaseHandler,
+    current_percent: f32,
+) -> Option<BatteryEstimate> {
+    // Grab the last 200 readings, ordered newest first.
+    let rows = battery_log::Entity::find()
+        .order_by_desc(battery_log::Column::Time)
+        .limit(200)
+        .all(db.connection())
+        .await
+        .ok()?;
+
+    if rows.len() < 2 {
+        return None;
+    }
+
+    // Walk backward from newest until we hit a charging=true row — that's
+    // the start of the current discharge cycle. Only use non-charging
+    // readings for the regression.
+    let mut discharge: Vec<(f64, f64)> = Vec::new(); // (hours_since_first, percent)
+    let mut anchor_time = None;
+
+    for row in rows.iter().rev() {
+        if row.charging {
+            // Reset — new discharge cycle starts after this.
+            discharge.clear();
+            anchor_time = None;
+            continue;
+        }
+        let t = *anchor_time.get_or_insert(row.time);
+        let hours = (row.time - t).num_seconds() as f64 / 3600.0;
+        discharge.push((hours, row.percent));
+    }
+
+    if discharge.len() < 2 {
+        return None;
+    }
+
+    // Simple linear regression: percent = a + b * hours.
+    // b (slope) is the drain rate (negative = draining).
+    let n = discharge.len() as f64;
+    let sum_x: f64 = discharge.iter().map(|(x, _)| x).sum();
+    let sum_y: f64 = discharge.iter().map(|(_, y)| y).sum();
+    let sum_xy: f64 = discharge.iter().map(|(x, y)| x * y).sum();
+    let sum_xx: f64 = discharge.iter().map(|(x, _)| x * x).sum();
+
+    let denom = n * sum_xx - sum_x * sum_x;
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let slope = (n * sum_xy - sum_x * sum_y) / denom;
+
+    // slope should be negative (battery draining). If ≤ 0, drain_rate
+    // is the absolute value. If positive, battery is somehow increasing
+    // which doesn't make sense for a discharge model.
+    let drain_rate = -slope;
+    if drain_rate <= 0.01 {
+        return None;
+    }
+
+    let hours_remaining = f64::from(current_percent) / drain_rate;
+
+    let confidence = match discharge.len() {
+        0..=5 => "low",
+        6..=20 => "moderate",
+        _ => "good",
+    };
+
+    Some(BatteryEstimate {
+        hours_remaining: (hours_remaining * 10.0).round() / 10.0,
+        drain_rate_pct_per_hour: (drain_rate * 100.0).round() / 100.0,
+        data_points: discharge.len(),
+        confidence,
+    })
 }
 
 /// Connect, fire the strap's haptic alarm, disconnect. No response handling —
@@ -682,6 +799,23 @@ async fn run_sync(
         Ok(info) => {
             let state = app.state::<AppState>();
             *state.battery.write().await = Some(info);
+            // Compute recent avg bpm as context for drain-rate segmentation.
+            let avg_bpm = {
+                let now = Local::now().naive_local();
+                let ten_min_ago = now - TimeDelta::minutes(10);
+                let recent: Vec<heart_rate::Model> = heart_rate::Entity::find()
+                    .filter(heart_rate::Column::Time.gte(ten_min_ago))
+                    .all(db.connection())
+                    .await
+                    .unwrap_or_default();
+                if recent.is_empty() {
+                    None
+                } else {
+                    let sum: i64 = recent.iter().map(|r| i64::from(r.bpm)).sum();
+                    Some((sum / recent.len() as i64) as i16)
+                }
+            };
+            log_battery_reading(&db, &info, avg_bpm).await;
             Some(info)
         }
         Err(e) => {
@@ -798,6 +932,7 @@ async fn build_snapshot(
     sync_in_progress: bool,
     strap_seen_at: Option<NaiveDateTime>,
     alarm: Option<AlarmStatus>,
+    battery_estimate: Option<BatteryEstimate>,
 ) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
     let today = now.date();
@@ -832,6 +967,7 @@ async fn build_snapshot(
         sync_in_progress,
         strap_seen_at,
         alarm,
+        battery_estimate,
     })
 }
 

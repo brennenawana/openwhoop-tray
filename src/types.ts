@@ -11,6 +11,14 @@ export type Snapshot = {
   sync_in_progress: boolean;
   strap_seen_at: string | null;
   alarm: AlarmStatus | null;
+  battery_estimate: BatteryEstimate | null;
+};
+
+export type BatteryEstimate = {
+  hours_remaining: number;
+  drain_rate_pct_per_hour: number;
+  data_points: number;
+  confidence: "low" | "moderate" | "good";
 };
 
 export type AlarmStatus = {

@@ -226,9 +226,11 @@ function Section({
 function BatteryPill({
   percent,
   charging,
+  estimate,
 }: {
   percent: number;
   charging: boolean;
+  estimate: { hours_remaining: number; confidence: string } | null;
 }) {
   const color =
     charging
@@ -238,11 +240,26 @@ function BatteryPill({
       : percent > 20
       ? "bg-amber-400"
       : "bg-rose-400";
+  const timeStr = estimate
+    ? estimate.hours_remaining >= 1
+      ? `~${Math.round(estimate.hours_remaining)}h`
+      : `~${Math.round(estimate.hours_remaining * 60)}m`
+    : null;
   return (
-    <span className="inline-flex items-center gap-1 rounded-full border border-zinc-800 px-2 py-0.5 text-[9px] font-normal text-zinc-400 tabular-nums">
+    <span
+      className="inline-flex items-center gap-1 rounded-full border border-zinc-800 px-2 py-0.5 text-[9px] font-normal text-zinc-400 tabular-nums"
+      title={
+        estimate
+          ? `${estimate.hours_remaining.toFixed(1)}h remaining (${estimate.confidence} confidence)`
+          : undefined
+      }
+    >
       <span className={`w-1 h-1 rounded-full ${color}`} />
       {percent.toFixed(1)}%
       {charging && <span className="text-sky-400">⚡</span>}
+      {!charging && timeStr && (
+        <span className="text-zinc-500">{timeStr}</span>
+      )}
     </span>
   );
 }
@@ -609,6 +626,7 @@ function App() {
                 <BatteryPill
                   percent={snapshot.battery.percent}
                   charging={snapshot.battery.charging}
+                  estimate={snapshot.battery_estimate}
                 />
                 <WristPill isWorn={snapshot.battery.is_worn} />
               </>
