@@ -1,41 +1,50 @@
-# openwhoop-tray
+# OpenWhoop Tray
 
-A clean, minimal desktop companion for [openwhoop](https://github.com/bWanShiTong/openwhoop) — built with Tauri 2, React 19, and Tailwind 4. Links directly against the openwhoop Rust crates via a git submodule at `vendor/openwhoop`.
+A macOS menu bar companion for your WHOOP strap. Syncs data over Bluetooth, processes sleep/stress/strain metrics locally, and keeps everything on your machine — no cloud, no WHOOP subscription required.
 
-## Status
+Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com/bWanShiTong/openwhoop) Rust library.
 
-Phase 1a (in progress):
+## Features
 
-- [x] Tauri 2 scaffold (macOS, Windows, Linux)
-- [x] Rust backend linking `openwhoop-db`, `openwhoop-algos`, `openwhoop-codec`, `openwhoop-entities`, `openwhoop-types` as library path deps from the submodule
-- [x] `get_snapshot` command — reads heart-rate, sleep cycles, and activities from the SQLite database and returns a rich dashboard payload
-- [x] Dark-mode-first React UI with:
-  - Current HR, min/avg/max
-  - Latest stress, SpO₂, skin temp
-  - 24h hourly-HR bar sparkline
-  - Latest sleep card (duration, score, HR range, HRV range)
-  - Last-7-days summary (nights, avg sleep, consistency, workouts)
-- [x] App-data-dir SQLite path (`~/Library/Application Support/dev.brennen.openwhoop-tray/db.sqlite` on macOS)
-- [ ] `sync_now` command wired to real BLE + algo pipeline *(stub for now)*
-- [ ] Menu bar tray icon with live current-HR
-- [ ] Window hidden by default; click tray to toggle
-- [ ] First-run onboarding (device discovery + pick)
-- [ ] Configurable sync cadence
-- [ ] Launch at login
+- **Menu bar app** — lives in the tray, no dock icon. Left-click shows battery / presence / last sync at a glance.
+- **Background sync** — configurable auto-sync (manual / 15m / 1h / 4h / daily) plus sync-on-startup.
+- **Presence detection** — periodic BLE scan detects when the strap is nearby. Auto-syncs when you come back in range.
+- **Dashboard** — current HR, min/avg/max, 24h sparkline, stress, SpO₂, skin temp (F/C toggle), latest sleep with HRV, 7-day summary.
+- **Device status** — battery %, charging state, wrist-on/off, all read via the custom WHOOP protocol.
+- **Alarm control** — set, clear, and read the strap's alarm from the settings panel. Includes a "Buzz strap" find-my-device button.
+- **Device discovery** — scan for nearby WHOOP straps from the settings panel instead of typing the name manually.
+- **Launch at login** — macOS LaunchAgent integration.
 
-## Getting started
+## Install (release build)
+
+A pre-built `.app` bundle is in `src-tauri/target/release/bundle/macos/` after running the build:
 
 ```sh
-# First clone
-git clone --recursive <this-repo-url>
+pnpm tauri build
+```
+
+Then copy to Applications:
+
+```sh
+cp -R src-tauri/target/release/bundle/macos/OpenWhoop.app /Applications/
+open /Applications/OpenWhoop.app
+```
+
+A `.dmg` is also produced at `src-tauri/target/release/bundle/dmg/OpenWhoop_0.1.0_aarch64.dmg`.
+
+On first launch, macOS will prompt for Bluetooth permission — approve it once.
+
+## Development
+
+```sh
+git clone --recursive <repo-url>
 cd openwhoop-tray
 pnpm install
-
-# Run in dev
 pnpm tauri dev
 ```
 
 If you already cloned without `--recursive`:
+
 ```sh
 git submodule update --init --recursive
 ```
@@ -44,26 +53,31 @@ git submodule update --init --recursive
 
 ```
 openwhoop-tray/
-├── src/                      # React frontend (TypeScript)
-│   ├── App.tsx               # Main dashboard view
-│   ├── types.ts              # Type mirror of Rust Snapshot struct
-│   └── App.css               # Tailwind import + dark theme vars
-├── src-tauri/                # Rust backend
-│   ├── Cargo.toml            # Depends on openwhoop crates via path
-│   └── src/lib.rs            # Tauri commands + snapshot assembly
+├── src/                      # React frontend (TypeScript + Tailwind)
+├── src-tauri/                # Rust backend (Tauri 2)
+│   ├── src/lib.rs            # All Tauri commands, scheduler, presence loop
+│   ├── Info.plist            # Bluetooth permission + LSUIElement
+│   └── Cargo.toml            # Depends on openwhoop crates via path
 └── vendor/
-    └── openwhoop/            # git submodule -> brennenawana/openwhoop
-                              # (integration/whoop-tray branch)
+    └── openwhoop/            # git submodule (openwhoop library)
 ```
 
-The Rust side is the sole owner of the database and BLE connection. The React side is pure presentation — it invokes Tauri commands and renders the result.
+The Rust backend owns the BLE connection, SQLite database, and all algorithms. The React frontend is pure presentation — it calls Tauri commands and renders results.
 
-## DB location
+## Data location
 
 | Platform | Path |
 |---|---|
-| macOS | `~/Library/Application Support/dev.brennen.openwhoop-tray/db.sqlite` |
-| Linux | `~/.local/share/dev.brennen.openwhoop-tray/db.sqlite` |
-| Windows | `%APPDATA%\dev.brennen.openwhoop-tray\db.sqlite` |
+| macOS | `~/Library/Application Support/dev.brennen.openwhoop-tray/` |
+| Linux | `~/.local/share/dev.brennen.openwhoop-tray/` |
+| Windows | `%APPDATA%\dev.brennen.openwhoop-tray\` |
 
-For now, if you want to point at an existing `db.sqlite` you've been building with the CLI, copy it into the app data dir before first launch.
+Contains `db.sqlite` (all health data) and `config.json` (device name, sync interval, presence interval).
+
+## Distribution
+
+To distribute to others:
+
+1. `pnpm tauri build` produces `OpenWhoop.app` and a `.dmg`
+2. Ad-hoc sign: `codesign --force --deep --sign - OpenWhoop.app`
+3. For proper distribution, sign with an Apple Developer ID certificate and notarize via `xcrun notarytool`
