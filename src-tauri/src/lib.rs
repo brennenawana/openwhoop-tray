@@ -699,7 +699,7 @@ async fn run_sync(
     db: DatabaseHandler,
     device_name: String,
 ) -> anyhow::Result<SyncReport> {
-    const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 
     let start = Instant::now();
     let before = heart_rate::Entity::find().count(db.connection()).await? as usize;
