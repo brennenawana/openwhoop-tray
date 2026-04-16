@@ -963,9 +963,24 @@ async fn build_snapshot(
         })
         .await?;
 
+    // Chart series: last 24h (not just today) so the 24H chart scale works
+    // even right after midnight.
+    let twenty_four_ago = now - TimeDelta::hours(24);
+    let hr_series: Vec<HrPoint> = heart_rate::Entity::find()
+        .filter(heart_rate::Column::Time.gte(twenty_four_ago))
+        .order_by_asc(heart_rate::Column::Time)
+        .all(db.connection())
+        .await?
+        .iter()
+        .map(|r| HrPoint {
+            t: r.time,
+            b: r.bpm.max(0).min(255) as u8,
+        })
+        .collect();
+
     Ok(Snapshot {
         generated_at: now,
-        today: build_today(&today_rows),
+        today: build_today(&today_rows, hr_series),
         latest_sleep: sleep_cycles.last().map(build_sleep_section),
         week: build_week(&sleep_cycles, &recent_activities, week_start)?,
         recent_activities: build_activity_list(&recent_activities),
@@ -980,7 +995,7 @@ async fn build_snapshot(
     })
 }
 
-fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
+fn build_today(rows: &[heart_rate::Model], series_rows: Vec<HrPoint>) -> TodaySection {
     if rows.is_empty() {
         return TodaySection {
             sample_count: 0,
@@ -993,7 +1008,7 @@ fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
             latest_spo2: None,
             latest_skin_temp: None,
             hourly_bpm: [None; 24],
-            hr_series: Vec::new(),
+            hr_series: series_rows,
         };
     }
 
@@ -1020,14 +1035,6 @@ fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
         }
     }
 
-    let hr_series: Vec<HrPoint> = rows
-        .iter()
-        .map(|r| HrPoint {
-            t: r.time,
-            b: r.bpm.max(0).min(255) as u8,
-        })
-        .collect();
-
     TodaySection {
         sample_count: rows.len(),
         last_seen: Some(rows.last().unwrap().time),
@@ -1039,7 +1046,7 @@ fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
         latest_spo2: rows.iter().rev().find_map(|r| r.spo2),
         latest_skin_temp: rows.iter().rev().find_map(|r| r.skin_temp),
         hourly_bpm: hourly,
-        hr_series,
+        hr_series: series_rows,
     }
 }
 
