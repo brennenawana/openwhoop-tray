@@ -130,36 +130,152 @@ function classifyError(raw: string): ClassifiedError {
   return { message: raw, hint: null, retryable: true };
 }
 
-function Sparkline({ values }: { values: (number | null)[] }) {
-  const filled = values.filter((v): v is number => v !== null);
-  if (filled.length === 0) {
-    return <div className="text-zinc-600 text-xs">No data yet.</div>;
+type TimeScale = { label: string; hours: number; bins: number; binMinutes: number };
+
+const TIME_SCALES: TimeScale[] = [
+  { label: "1H", hours: 1, bins: 20, binMinutes: 3 },
+  { label: "2H", hours: 2, bins: 24, binMinutes: 5 },
+  { label: "4H", hours: 4, bins: 24, binMinutes: 10 },
+  { label: "8H", hours: 8, bins: 24, binMinutes: 20 },
+  { label: "12H", hours: 12, bins: 24, binMinutes: 30 },
+  { label: "24H", hours: 24, bins: 24, binMinutes: 60 },
+];
+
+type Bin = {
+  label: string;
+  min: number;
+  avg: number;
+  max: number;
+  count: number;
+} | null;
+
+function binSeries(
+  series: { t: string; b: number }[],
+  scale: TimeScale,
+): Bin[] {
+  const now = Date.now();
+  const windowStart = now - scale.hours * 3600_000;
+  const binMs = scale.binMinutes * 60_000;
+  const bins: Bin[] = Array(scale.bins).fill(null);
+
+  for (const pt of series) {
+    const ts = new Date(pt.t).getTime();
+    if (ts < windowStart || ts > now) continue;
+    const idx = Math.min(
+      Math.floor((ts - windowStart) / binMs),
+      scale.bins - 1,
+    );
+    const b = bins[idx];
+    if (b) {
+      b.min = Math.min(b.min, pt.b);
+      b.max = Math.max(b.max, pt.b);
+      b.avg = (b.avg * b.count + pt.b) / (b.count + 1);
+      b.count++;
+    } else {
+      const binStart = new Date(windowStart + idx * binMs);
+      bins[idx] = {
+        label: binStart.toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        min: pt.b,
+        avg: pt.b,
+        max: pt.b,
+        count: 1,
+      };
+    }
   }
-  const min = Math.min(...filled);
-  const max = Math.max(...filled);
-  const span = Math.max(1, max - min);
-  const currentHour = new Date().getHours();
+  return bins;
+}
+
+function zoneColor(bpm: number): string {
+  if (bpm < 65) return "bg-emerald-500";
+  if (bpm < 85) return "bg-emerald-400";
+  if (bpm < 100) return "bg-amber-400";
+  if (bpm < 120) return "bg-orange-400";
+  return "bg-rose-400";
+}
+
+function HrChart({
+  series,
+}: {
+  series: { t: string; b: number }[];
+}) {
+  const [scaleIdx, setScaleIdx] = useState(TIME_SCALES.length - 1);
+  const [hovered, setHovered] = useState<Bin>(null);
+  const scale = TIME_SCALES[scaleIdx];
+  const bins = binSeries(series, scale);
+
+  const filled = bins.filter((b): b is NonNullable<Bin> => b !== null);
+  if (filled.length === 0) {
+    return <div className="text-zinc-600 text-xs">No data in this window.</div>;
+  }
+  const globalMin = Math.min(...filled.map((b) => b.min));
+  const globalMax = Math.max(...filled.map((b) => b.max));
+  const span = Math.max(1, globalMax - globalMin);
+
+  // Generate ~5 evenly spaced time labels across the window.
+  const windowStart = Date.now() - scale.hours * 3600_000;
+  const labelCount = 5;
+  const labels = Array.from({ length: labelCount }, (_, i) => {
+    const ts = windowStart + (i / (labelCount - 1)) * scale.hours * 3600_000;
+    return new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  });
+
   return (
-    <div className="flex items-end gap-[2px] h-10 w-full">
-      {values.map((v, i) => {
-        const isActive = i === currentHour;
-        const height =
-          v === null ? 4 : 6 + Math.round(((v - min) / span) * 28);
-        return (
-          <div
-            key={i}
-            className={`flex-1 rounded-sm transition-all ${
-              v === null
-                ? "bg-zinc-800"
-                : isActive
-                ? "bg-rose-400"
-                : "bg-zinc-500"
-            }`}
-            style={{ height }}
-            title={v === null ? `${i}:00 — no data` : `${i}:00 — ${v} bpm`}
-          />
-        );
-      })}
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <div className="flex gap-1">
+          {TIME_SCALES.map((s, i) => (
+            <button
+              key={s.label}
+              onClick={() => setScaleIdx(i)}
+              className={`rounded px-1.5 py-0.5 text-[9px] font-medium transition-colors ${
+                i === scaleIdx
+                  ? "bg-zinc-700 text-zinc-100"
+                  : "text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        {hovered && (
+          <span className="text-[9px] text-zinc-400 tabular-nums">
+            {hovered.label} — {Math.round(hovered.min)}/{Math.round(hovered.avg)}/{Math.round(hovered.max)} bpm
+            <span className="text-zinc-600 ml-1">(lo/avg/hi)</span>
+          </span>
+        )}
+      </div>
+      <div
+        className="flex items-end gap-[2px] h-12 w-full"
+        onMouseLeave={() => setHovered(null)}
+      >
+        {bins.map((bin, i) => {
+          const height =
+            bin === null
+              ? 4
+              : 6 + Math.round(((bin.avg - globalMin) / span) * 40);
+          return (
+            <div
+              key={i}
+              className={`flex-1 rounded-sm transition-all cursor-default ${
+                bin === null ? "bg-zinc-800/50" : zoneColor(bin.avg)
+              }`}
+              style={{ height, opacity: bin === null ? 0.3 : 0.85 }}
+              onMouseEnter={() => setHovered(bin)}
+            />
+          );
+        })}
+      </div>
+      <div className="flex justify-between text-[9px] text-zinc-600 tabular-nums">
+        {labels.map((l, i) => (
+          <span key={i}>{l}</span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -956,14 +1072,7 @@ function App() {
               />
             </div>
             <div className="pt-2">
-              <Sparkline values={t.hourly_bpm} />
-              <div className="flex justify-between text-[9px] text-zinc-600 tabular-nums pt-1">
-                <span>0</span>
-                <span>6</span>
-                <span>12</span>
-                <span>18</span>
-                <span>23</span>
-              </div>
+              <HrChart series={t.hr_series} />
             </div>
           </>
         ) : (

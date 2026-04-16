@@ -55,6 +55,12 @@ export type TodaySection = {
   latest_spo2: number | null;
   latest_skin_temp: number | null;
   hourly_bpm: (number | null)[];
+  hr_series: HrPoint[];
+};
+
+export type HrPoint = {
+  t: string;
+  b: number;
 };
 
 export type SleepSection = {

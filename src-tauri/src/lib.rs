@@ -152,6 +152,15 @@ struct TodaySection {
     latest_spo2: Option<f64>,
     latest_skin_temp: Option<f64>,
     hourly_bpm: [Option<u16>; 24],
+    /// Lightweight (time, bpm) series for the last 24h so the frontend can
+    /// re-bin at any time scale without round-tripping.
+    hr_series: Vec<HrPoint>,
+}
+
+#[derive(Serialize, Clone)]
+struct HrPoint {
+    t: NaiveDateTime,
+    b: u8,
 }
 
 #[derive(Serialize, Clone)]
@@ -984,6 +993,7 @@ fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
             latest_spo2: None,
             latest_skin_temp: None,
             hourly_bpm: [None; 24],
+            hr_series: Vec::new(),
         };
     }
 
@@ -1010,6 +1020,14 @@ fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
         }
     }
 
+    let hr_series: Vec<HrPoint> = rows
+        .iter()
+        .map(|r| HrPoint {
+            t: r.time,
+            b: r.bpm.max(0).min(255) as u8,
+        })
+        .collect();
+
     TodaySection {
         sample_count: rows.len(),
         last_seen: Some(rows.last().unwrap().time),
@@ -1021,6 +1039,7 @@ fn build_today(rows: &[heart_rate::Model]) -> TodaySection {
         latest_spo2: rows.iter().rev().find_map(|r| r.spo2),
         latest_skin_temp: rows.iter().rev().find_map(|r| r.skin_temp),
         hourly_bpm: hourly,
+        hr_series,
     }
 }
 
