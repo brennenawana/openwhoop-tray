@@ -261,6 +261,81 @@ Raw BLE packets — the source-of-truth archive.
 
 ---
 
+## Data received but NOT captured
+
+The strap sends significantly more data than we currently store. This section catalogs every known gap.
+
+### EVENTS_FROM_STRAP — subscribed to, but silently dropped
+
+The code subscribes to the EVENTS_FROM_STRAP BLE characteristic during `initialize()`, so the strap pushes event notifications. However, `handle_packet` only routes notifications from DATA_FROM_STRAP and CMD_FROM_STRAP — any other UUID hits a catch-all `return Ok(None)`. All of the following real-time push events are received and discarded:
+
+| Event ID | Name | What it signals |
+|---|---|---|
+| 3 | BatteryLevel | Battery percentage changed |
+| 5 | External5vOn | External power connected |
+| 6 | External5vOff | External power disconnected |
+| 7 | ChargingOn | Charging started |
+| 8 | ChargingOff | Charging stopped |
+| 9 | WristOn | Strap placed on wrist |
+| 10 | WristOff | Strap removed from wrist |
+| 14 | DoubleTap | User double-tapped the strap |
+| 63 | ExtendedBatteryInformation | Extended battery telemetry |
+| 96 | HighFreqSyncPrompt | Strap requesting high-frequency sync |
+
+**Root cause**: one-line UUID routing bug. Fixing it would unlock live state notifications without polling.
+
+### Parsed but then ignored (no-op handlers)
+
+These WhoopData variants are decoded successfully but matched to empty `{}` blocks in `handle_data`:
+
+| Variant | Fields available | What's lost |
+|---|---|---|
+| `Event { unix, event }` | Timestamp + event type enum | Event log with classification |
+| `UnknownEvent { unix, event }` | Timestamp + raw u8 event code | Unmapped events from newer firmware |
+| `RunAlarm { unix }` | Timestamp when alarm fired | Alarm execution history |
+| `AlarmInfo { enabled, unix }` | Enabled flag + scheduled time | Only used transiently in get_alarm(), never persisted |
+
+### Logged but not stored
+
+| Variant | Log level | What's lost by not persisting |
+|---|---|---|
+| `ConsoleLog { unix, log }` | `trace!` | Firmware diagnostic messages (sensor errors, calibration, internal state) |
+| `VersionInfo { harvard, boylston }` | `info!` | No audit trail linking data to the firmware version that produced it |
+
+### Packet types with no parser (silently dropped)
+
+These `PacketType` variants are defined in the codec but `from_packet()` has no match arm — they fall through to `Err(Unimplemented)` and are silently caught in `handle_packet`.
+
+| PacketType | Hex | What it carries |
+|---|---|---|
+| RealtimeData | 0x28 | Live HR at ~10Hz when ToggleRealtimeHr (cmd 3) is enabled |
+| RealtimeRawData | 0x2B | Raw PPG waveform — enables respiratory rate extraction, pulse waveform analysis |
+| RealtimeImuDataStream | 0x33 | Streaming 6-axis accelerometer + gyroscope |
+| HistoricalImuDataStream | 0x34 | Batched historical IMU data |
+
+### Command responses from initialize() — all dropped
+
+During startup, four commands are sent but only two response types are handled in the `CommandResponse` match:
+
+| Command sent | Response cmd | Handled? | What's lost |
+|---|---|---|---|
+| hello_harvard (35) | GetHelloHarvard (35) | ❌ falls to Unimplemented | Charging state, wrist state, device status struct |
+| set_time (10) | SetClock (10) | ❌ | Confirmation the clock was set |
+| get_name (76) | GetAdvertisingNameHarvard (76) | ❌ | The device's own advertising name |
+| enter_high_freq_sync (96) | EnterHighFreqSync (96) | ❌ | HFS mode confirmation |
+
+Only `ReportVersionInfo` (7) and `GetAlarmTime` (67) responses are actually parsed. The tray app added parsers for `GetBatteryLevel` (26) and `GetHelloHarvard` (35) but only for explicit on-demand reads, not for the init-time responses.
+
+### Raw packets are conditional
+
+The `packets` table only gets written when `debug_packets=true` (off by default). In normal operation, raw BLE wire bytes are never stored. Old sessions cannot be replayed or re-parsed if new packet handlers are added later.
+
+### No database tables exist for
+
+Events, console logs, device info/version history, alarm history, or any realtime stream data. The entire persisted schema is four tables: `packets` (conditional), `heart_rate`, `sleep_cycles`, `activities`.
+
+---
+
 ## Firmware context
 
 - **Tested hardware**: WHOOP 4.0
