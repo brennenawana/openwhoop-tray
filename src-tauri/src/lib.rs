@@ -287,6 +287,24 @@ async fn ring_strap(app: AppHandle) -> Result<(), String> {
     do_ring_strap(app).await.map_err(|e| e.to_string())
 }
 
+/// Return the full sleep-staging snapshot for the most recent cycle.
+/// `None` when no sleep has been detected + staged yet.
+///
+/// This is the Phase-1 data source for the hypnogram / stage-breakdown /
+/// score-component UI in the Latest Sleep card. The snapshot is
+/// re-computed on every call (it reads the cycle + epochs from SQLite
+/// and quantizes the hypnogram to 1-minute resolution); for a typical
+/// 960-epoch night it's sub-millisecond.
+#[tauri::command]
+async fn get_sleep_snapshot(
+    state: State<'_, AppState>,
+) -> Result<Option<openwhoop::sleep_staging::SleepSnapshot>, String> {
+    let db = ensure_db(&state).await?;
+    openwhoop::sleep_staging::latest_sleep_snapshot(&db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------- battery prediction
 
 async fn log_battery_reading(
@@ -1583,6 +1601,7 @@ pub fn run() {
             set_alarm,
             clear_alarm,
             ring_strap,
+            get_sleep_snapshot,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
