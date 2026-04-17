@@ -456,11 +456,22 @@ const TIME_SCALES: TimeScale[] = [
 
 type Bin = {
   label: string;
-  min: number;
+  lo: number;  // 10th percentile — typical low
   avg: number;
-  max: number;
+  hi: number;  // 90th percentile — typical high
   count: number;
 } | null;
+
+// Percentile on an ascending-sorted array using linear interpolation.
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0];
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
 
 function binSeries(
   series: { t: string; b: number }[],
@@ -469,7 +480,11 @@ function binSeries(
   const now = Date.now();
   const windowStart = now - scale.hours * 3600_000;
   const binMs = scale.binMinutes * 60_000;
-  const bins: Bin[] = Array(scale.bins).fill(null);
+  // Collect raw samples per bin, then compute percentiles in a second
+  // pass. Raw min/max over a 60-min bucket (~3600 samples at 1 Hz) is
+  // dominated by single-sample artifacts — a brief motion spike pulls
+  // max to 107 even if 95% of the hour is between 70 and 92.
+  const buckets: number[][] = Array.from({ length: scale.bins }, () => []);
 
   for (const pt of series) {
     const ts = new Date(pt.t).getTime();
@@ -478,27 +493,26 @@ function binSeries(
       Math.floor((ts - windowStart) / binMs),
       scale.bins - 1,
     );
-    const b = bins[idx];
-    if (b) {
-      b.min = Math.min(b.min, pt.b);
-      b.max = Math.max(b.max, pt.b);
-      b.avg = (b.avg * b.count + pt.b) / (b.count + 1);
-      b.count++;
-    } else {
-      const binStart = new Date(windowStart + idx * binMs);
-      bins[idx] = {
-        label: binStart.toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-        min: pt.b,
-        avg: pt.b,
-        max: pt.b,
-        count: 1,
-      };
-    }
+    buckets[idx].push(pt.b);
   }
-  return bins;
+
+  return buckets.map((samples, idx) => {
+    if (samples.length === 0) return null;
+    samples.sort((a, b) => a - b);
+    const avg =
+      samples.reduce((sum, v) => sum + v, 0) / samples.length;
+    const binStart = new Date(windowStart + idx * binMs);
+    return {
+      label: binStart.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      lo: percentile(samples, 0.10),
+      avg,
+      hi: percentile(samples, 0.90),
+      count: samples.length,
+    };
+  });
 }
 
 function zoneColor(bpm: number): string {
@@ -523,8 +537,8 @@ function HrChart({
   if (filled.length === 0) {
     return <div className="text-zinc-600 text-xs">No data in this window.</div>;
   }
-  const globalMin = Math.min(...filled.map((b) => b.min));
-  const globalMax = Math.max(...filled.map((b) => b.max));
+  const globalMin = Math.min(...filled.map((b) => b.lo));
+  const globalMax = Math.max(...filled.map((b) => b.hi));
   const span = Math.max(1, globalMax - globalMin);
 
   // Generate ~5 evenly spaced time labels across the window.
@@ -558,8 +572,8 @@ function HrChart({
         </div>
         {hovered && (
           <span className="text-[9px] text-zinc-400 tabular-nums">
-            {hovered.label} — {Math.round(hovered.min)}/{Math.round(hovered.avg)}/{Math.round(hovered.max)} bpm
-            <span className="text-zinc-600 ml-1">(lo/avg/hi)</span>
+            {hovered.label} — {Math.round(hovered.lo)}/{Math.round(hovered.avg)}/{Math.round(hovered.hi)} bpm
+            <span className="text-zinc-600 ml-1">(p10/avg/p90)</span>
           </span>
         )}
       </div>
