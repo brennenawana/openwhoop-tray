@@ -138,3 +138,65 @@ export type SleepSnapshot = {
   /// Nights in the rolling user baseline (<14 = still calibrating).
   baseline_window_nights: number | null;
 };
+
+// ---- daily snapshot (get_daily_snapshot command) ----
+
+export type HrvContext = "resting" | "active" | "mixed";
+
+export type HrvSampleLite = {
+  window_start: string;
+  window_end: string;
+  rmssd: number;
+  mean_hr: number;
+  context: HrvContext | string;
+};
+
+export type ActivityBreakdown = {
+  sedentary_min: number;
+  light_min: number;
+  moderate_min: number;
+  vigorous_min: number;
+  unknown_min: number;
+};
+
+export type EventLite = {
+  timestamp: string;
+  event_id: number;
+  event_name: string;
+};
+
+export type DeviceInfoLite = {
+  recorded_at: string;
+  harvard_version: string | null;
+  boylston_version: string | null;
+  device_name: string | null;
+};
+
+export type AlarmLite = {
+  action: string;
+  action_at: string;
+  scheduled_for: string | null;
+  enabled: boolean | null;
+};
+
+export type SyncLogLite = {
+  attempt_started_at: string;
+  attempt_ended_at: string | null;
+  outcome: string;
+  error_message: string | null;
+  heart_rate_rows_added: number | null;
+  sleep_cycles_created: number | null;
+  trigger: string | null;
+};
+
+export type DailySnapshot = {
+  day_start: string;
+  generated_at: string;
+  today_wear_minutes: number;
+  today_hrv_samples: HrvSampleLite[];
+  today_activity_breakdown: ActivityBreakdown;
+  recent_events: EventLite[];
+  device_info: DeviceInfoLite | null;
+  alarm_history: AlarmLite[];
+  recent_sync_log: SyncLogLite[];
+};

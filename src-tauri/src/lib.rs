@@ -305,6 +305,20 @@ async fn get_sleep_snapshot(
         .map_err(|e| e.to_string())
 }
 
+/// Phase-2 Today card: today's wear time, HRV, activity breakdown,
+/// events, device info, alarms, and sync log as a single payload.
+/// Fail-soft per source — a query failure substitutes empty/None
+/// rather than short-circuiting the whole snapshot.
+#[tauri::command]
+async fn get_daily_snapshot(
+    state: State<'_, AppState>,
+) -> Result<openwhoop::daily_snapshot::DailySnapshot, String> {
+    let db = ensure_db(&state).await?;
+    openwhoop::daily_snapshot::get_daily_snapshot(&db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------- battery prediction
 
 async fn log_battery_reading(
@@ -1602,6 +1616,7 @@ pub fn run() {
             clear_alarm,
             ring_strap,
             get_sleep_snapshot,
+            get_daily_snapshot,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

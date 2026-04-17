@@ -2,8 +2,12 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  ActivityBreakdown,
   AlarmStatus,
+  DailySnapshot,
   DiscoveredDevice,
+  EventLite,
+  HrvSampleLite,
   HypnogramEntry,
   ScoreComponentsBreakdown,
   SleepSnapshot,
@@ -106,6 +110,168 @@ function StageBreakdownBar({ stages }: { stages: SleepStageTotals }) {
           </span>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ---- Today card sub-components ----
+
+// Stacked horizontal bar for today's activity minutes. Same treatment
+// as the sleep stage bar, different palette (intensity-ramped).
+function ActivityBreakdownBar({ b }: { b: ActivityBreakdown }) {
+  const total =
+    b.sedentary_min + b.light_min + b.moderate_min + b.vigorous_min + b.unknown_min;
+  if (total <= 0) return null;
+  const entries: [string, number, string][] = [
+    ["Sedentary", b.sedentary_min, "#71717a"],  // zinc-500
+    ["Light", b.light_min, "#34d399"],          // emerald-400
+    ["Moderate", b.moderate_min, "#f59e0b"],    // amber-500
+    ["Vigorous", b.vigorous_min, "#ef4444"],    // red-500
+    ["Unknown", b.unknown_min, "#3f3f46"],      // zinc-700
+  ];
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="h-2 w-full rounded-full overflow-hidden flex bg-zinc-900">
+        {entries.map(([label, min, color]) => {
+          const pct = (min / total) * 100;
+          if (pct < 0.5) return null;
+          return (
+            <div
+              key={label}
+              className="h-full"
+              style={{ width: `${pct}%`, backgroundColor: color }}
+              title={`${label}: ${Math.round(min)}m`}
+            />
+          );
+        })}
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-zinc-400 tabular-nums">
+        {entries
+          .filter(([, min]) => min > 0)
+          .map(([label, min, color]) => (
+            <span key={label} className="inline-flex items-center gap-1">
+              <span
+                className="inline-block h-2 w-2 rounded-sm"
+                style={{ backgroundColor: color }}
+              />
+              {label} {Math.round(min)}m
+            </span>
+          ))}
+      </div>
+    </div>
+  );
+}
+
+// Sparkline of today's HRV samples (mean_hr vs rmssd not both — just
+// rmssd). Context colors the dots: resting green, active red, mixed
+// zinc. SVG, no library.
+function HrvSparkline({ samples }: { samples: HrvSampleLite[] }) {
+  if (samples.length === 0) return null;
+  const width = 280;
+  const height = 48;
+  const pad = 4;
+  const min = Math.min(...samples.map((s) => s.rmssd));
+  const max = Math.max(...samples.map((s) => s.rmssd));
+  const range = Math.max(1, max - min);
+  const t0 = new Date(samples[0].window_start).getTime();
+  const t1 = new Date(samples[samples.length - 1].window_end).getTime();
+  const tRange = Math.max(1, t1 - t0);
+  const points = samples.map((s) => {
+    const t = new Date(s.window_start).getTime();
+    const x = pad + ((t - t0) / tRange) * (width - 2 * pad);
+    const y =
+      height - pad - ((s.rmssd - min) / range) * (height - 2 * pad);
+    return { x, y, s };
+  });
+  const path = points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+    .join(" ");
+  const contextColor = (c: string) =>
+    c === "resting" ? "#10b981" : c === "active" ? "#ef4444" : "#a1a1aa";
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-baseline justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+          HRV (RMSSD) today
+        </span>
+        <span className="text-[10px] text-zinc-500 tabular-nums">
+          {samples.length} sample{samples.length === 1 ? "" : "s"} ·{" "}
+          {Math.round(min)}–{Math.round(max)} ms
+        </span>
+      </div>
+      <svg
+        width={width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        className="w-full rounded bg-zinc-900/50"
+        preserveAspectRatio="none"
+      >
+        <path
+          d={path}
+          fill="none"
+          stroke="#a1a1aa"
+          strokeWidth="1"
+          strokeOpacity="0.5"
+        />
+        {points.map((p, i) => (
+          <circle
+            key={i}
+            cx={p.x}
+            cy={p.y}
+            r={2}
+            fill={contextColor(p.s.context)}
+          >
+            <title>
+              {new Date(p.s.window_start).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+              : RMSSD {Math.round(p.s.rmssd)} ms · HR {Math.round(p.s.mean_hr)} ·{" "}
+              {p.s.context}
+            </title>
+          </circle>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// Compact list of today's events — timestamp + name. Collapses
+// consecutive duplicates (e.g. back-to-back BatteryLevel pings).
+function EventsList({ events }: { events: EventLite[] }) {
+  if (events.length === 0) return null;
+  const fmt = (iso: string) =>
+    new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  // Dedupe consecutive same-name (keep first of each run).
+  const deduped: EventLite[] = [];
+  let lastName = "";
+  for (const e of events) {
+    if (e.event_name !== lastName) {
+      deduped.push(e);
+      lastName = e.event_name;
+    }
+  }
+  const todayEvents = deduped
+    .filter((e) => {
+      const d = new Date(e.timestamp);
+      return d.toDateString() === new Date().toDateString();
+    })
+    .slice(-8)
+    .reverse();
+  if (todayEvents.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+        Recent events
+      </span>
+      <ul className="flex flex-col gap-0.5 text-[11px] text-zinc-300 tabular-nums">
+        {todayEvents.map((e, i) => (
+          <li key={i} className="flex items-baseline gap-2">
+            <span className="text-zinc-500 w-10">{fmt(e.timestamp)}</span>
+            <span>{e.event_name}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -582,6 +748,7 @@ type BackendConfig = {
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [sleepSnapshot, setSleepSnapshot] = useState<SleepSnapshot | null>(null);
+  const [dailySnapshot, setDailySnapshot] = useState<DailySnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncStage, setSyncStage] = useState<SyncStage | null>(null);
@@ -679,6 +846,13 @@ function App() {
         setSleepSnapshot(sleep);
       } catch {
         setSleepSnapshot(null);
+      }
+      // Phase 2: today's daytime data. Same non-fatal pattern.
+      try {
+        const daily = await invoke<DailySnapshot>("get_daily_snapshot");
+        setDailySnapshot(daily);
+      } catch {
+        setDailySnapshot(null);
       }
     } catch (e) {
       setError(String(e));
@@ -917,6 +1091,31 @@ function App() {
               ? `Last refresh ${formatClock(snapshot.generated_at)}`
               : "Loading…"}
           </p>
+          {dailySnapshot && (
+            <p className="text-[10px] text-zinc-600 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 mt-0.5">
+              {dailySnapshot.device_info?.harvard_version && (
+                <span>
+                  fw{" "}
+                  <span className="text-zinc-500">
+                    {dailySnapshot.device_info.harvard_version}
+                    {dailySnapshot.device_info.boylston_version
+                      ? ` · ${dailySnapshot.device_info.boylston_version}`
+                      : ""}
+                  </span>
+                </span>
+              )}
+              {dailySnapshot.recent_sync_log[0]?.outcome === "error" && (
+                <span
+                  className="text-amber-400"
+                  title={
+                    dailySnapshot.recent_sync_log[0]?.error_message ?? undefined
+                  }
+                >
+                  last sync failed
+                </span>
+              )}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -1365,6 +1564,42 @@ function App() {
           </p>
         )}
       </Section>
+
+      {dailySnapshot && (
+        <Section title="Today's activity">
+          <div className="flex flex-col gap-3">
+            {dailySnapshot.today_wear_minutes > 0 && (
+              <div className="flex items-baseline justify-between text-xs">
+                <span className="text-zinc-400">Wear time</span>
+                <span className="text-zinc-200 tabular-nums">
+                  {formatDuration(Math.round(dailySnapshot.today_wear_minutes))}
+                </span>
+              </div>
+            )}
+            {dailySnapshot.today_activity_breakdown &&
+              (dailySnapshot.today_activity_breakdown.sedentary_min +
+                dailySnapshot.today_activity_breakdown.light_min +
+                dailySnapshot.today_activity_breakdown.moderate_min +
+                dailySnapshot.today_activity_breakdown.vigorous_min) >
+                0 && (
+                <ActivityBreakdownBar
+                  b={dailySnapshot.today_activity_breakdown}
+                />
+              )}
+            {dailySnapshot.today_hrv_samples.length > 0 && (
+              <HrvSparkline samples={dailySnapshot.today_hrv_samples} />
+            )}
+            <EventsList events={dailySnapshot.recent_events} />
+            {dailySnapshot.today_wear_minutes === 0 &&
+              dailySnapshot.today_hrv_samples.length === 0 &&
+              dailySnapshot.recent_events.length === 0 && (
+                <p className="text-xs text-zinc-500">
+                  No data today yet. Run <em>detect-events</em> after a sync.
+                </p>
+              )}
+          </div>
+        </Section>
+      )}
 
       <Section title="Last 7 days">
         {w && (w.sleep_nights > 0 || w.workout_count > 0) ? (
