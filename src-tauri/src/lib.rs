@@ -846,6 +846,7 @@ async fn run_sync(
     whoop.calculate_stress().await?;
     whoop.calculate_spo2().await?;
     whoop.calculate_skin_temp().await?;
+    whoop.stage_sleep().await?;
 
     let after = heart_rate::Entity::find().count(db.connection()).await? as usize;
     let sleep_nights = db.get_sleep_cycles(None).await?.len();
