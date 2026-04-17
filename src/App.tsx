@@ -1,8 +1,148 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AlarmStatus, DiscoveredDevice, Snapshot } from "./types";
+import type {
+  AlarmStatus,
+  DiscoveredDevice,
+  HypnogramEntry,
+  ScoreComponentsBreakdown,
+  SleepSnapshot,
+  SleepStage,
+  SleepStageTotals,
+  Snapshot,
+} from "./types";
 import "./App.css";
+
+// Stage → hex color. Matches standard hypnogram convention:
+// REM reddish, Deep dark blue, Light lighter blue, Wake gray,
+// Unknown striped out.
+const STAGE_COLOR: Record<SleepStage, string> = {
+  Wake: "#71717a",       // zinc-500
+  Light: "#60a5fa",      // blue-400
+  Deep: "#1e3a8a",       // blue-900
+  REM: "#f472b6",        // pink-400
+  Unknown: "#3f3f46",    // zinc-700
+};
+
+// Hypnogram: horizontal SVG strip showing stage over time.
+// Width: 100%, height: 36px. Each segment's width is proportional to
+// its (end - start) / total_duration.
+function HypnogramStrip({ hypnogram }: { hypnogram: HypnogramEntry[] }) {
+  if (hypnogram.length === 0) {
+    return (
+      <div className="h-9 rounded bg-zinc-900 grid place-items-center text-[10px] text-zinc-600">
+        no hypnogram
+      </div>
+    );
+  }
+  const t0 = new Date(hypnogram[0].start).getTime();
+  const t1 = new Date(hypnogram[hypnogram.length - 1].end).getTime();
+  const total = Math.max(1, t1 - t0);
+  return (
+    <div className="h-9 w-full rounded overflow-hidden flex">
+      {hypnogram.map((h, i) => {
+        const s = new Date(h.start).getTime();
+        const e = new Date(h.end).getTime();
+        const pct = ((e - s) / total) * 100;
+        return (
+          <div
+            key={i}
+            className="h-full"
+            style={{
+              width: `${pct}%`,
+              backgroundColor: STAGE_COLOR[h.stage] ?? STAGE_COLOR.Unknown,
+            }}
+            title={`${h.stage} · ${formatTime(h.start)}–${formatTime(h.end)}`}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// Stacked horizontal bar showing per-stage minutes. Widths are
+// proportional to stage minutes. Segments below ~2% of total are
+// omitted from the bar (too narrow to be meaningful visually)
+// but still counted in the legend.
+function StageBreakdownBar({ stages }: { stages: SleepStageTotals }) {
+  const total =
+    stages.awake_min + stages.light_min + stages.deep_min + stages.rem_min;
+  if (total <= 0) {
+    return null;
+  }
+  const entries: [SleepStage, number][] = [
+    ["Wake", stages.awake_min],
+    ["Light", stages.light_min],
+    ["Deep", stages.deep_min],
+    ["REM", stages.rem_min],
+  ];
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="h-2 w-full rounded-full overflow-hidden flex bg-zinc-900">
+        {entries.map(([stage, min]) => {
+          const pct = (min / total) * 100;
+          if (pct < 0.5) return null;
+          return (
+            <div
+              key={stage}
+              className="h-full"
+              style={{
+                width: `${pct}%`,
+                backgroundColor: STAGE_COLOR[stage],
+              }}
+              title={`${stage}: ${Math.round(min)}m`}
+            />
+          );
+        })}
+      </div>
+      <div className="flex gap-3 text-[10px] text-zinc-400 tabular-nums">
+        {entries.map(([stage, min]) => (
+          <span key={stage} className="inline-flex items-center gap-1">
+            <span
+              className="inline-block h-2 w-2 rounded-sm"
+              style={{ backgroundColor: STAGE_COLOR[stage] }}
+            />
+            {stage} {Math.round(min)}m
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Score components as 5 mini horizontal bars (0–100 each). Compact;
+// renders the composite score's breakdown without a chart library.
+function ScoreComponentBars({ c }: { c: ScoreComponentsBreakdown }) {
+  const items: [string, number, string][] = [
+    ["Sufficiency", c.sufficiency, "bg-emerald-500"],
+    ["Efficiency", c.efficiency, "bg-blue-500"],
+    ["Restorative", c.restorative, "bg-violet-500"],
+    ["Consistency", c.consistency, "bg-amber-500"],
+    ["Sleep stress", c.sleep_stress, "bg-teal-500"],
+  ];
+  return (
+    <div className="grid grid-cols-5 gap-2">
+      {items.map(([label, value, bg]) => (
+        <div key={label} className="flex flex-col gap-1">
+          <div className="flex items-baseline justify-between gap-1">
+            <span className="text-[10px] text-zinc-500 truncate" title={label}>
+              {label}
+            </span>
+            <span className="text-[10px] text-zinc-300 tabular-nums">
+              {Math.round(value)}
+            </span>
+          </div>
+          <div className="h-1 w-full rounded-full bg-zinc-900 overflow-hidden">
+            <div
+              className={`h-full ${bg}`}
+              style={{ width: `${Math.max(0, Math.min(100, value))}%` }}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 type SyncStage = "scanning" | "connecting" | "downloading" | "processing" | "done";
 
@@ -441,6 +581,7 @@ type BackendConfig = {
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [sleepSnapshot, setSleepSnapshot] = useState<SleepSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncStage, setSyncStage] = useState<SyncStage | null>(null);
@@ -531,6 +672,14 @@ function App() {
       const snap = await invoke<Snapshot>("get_snapshot");
       setSnapshot(snap);
       setError(null);
+      // Phase 1: also pull the rich sleep snapshot. Failure here is
+      // non-fatal — staging may not have run on an empty DB.
+      try {
+        const sleep = await invoke<SleepSnapshot | null>("get_sleep_snapshot");
+        setSleepSnapshot(sleep);
+      } catch {
+        setSleepSnapshot(null);
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -1084,13 +1233,28 @@ function App() {
 
       <Section title="Latest sleep">
         {s ? (
-          <div className="flex flex-col gap-2">
-            <div className="flex items-baseline justify-between">
-              <span className="text-sm font-medium">{s.night}</span>
+          <div className="flex flex-col gap-3">
+            <div className="flex items-baseline justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{s.night}</span>
+                {sleepSnapshot &&
+                  sleepSnapshot.baseline_window_nights != null &&
+                  sleepSnapshot.baseline_window_nights < 14 && (
+                    <span
+                      className="rounded-full bg-amber-500/20 border border-amber-500/30 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-amber-300"
+                      title={`Score calibrating: ${sleepSnapshot.baseline_window_nights} of 14 nights of baseline history. Accuracy improves as more data accumulates.`}
+                    >
+                      Calibrating
+                    </span>
+                  )}
+              </div>
               <span className="text-xs text-zinc-500 tabular-nums">
                 {formatTime(s.start)} → {formatTime(s.end)}
               </span>
             </div>
+            {sleepSnapshot && sleepSnapshot.hypnogram.length > 0 && (
+              <HypnogramStrip hypnogram={sleepSnapshot.hypnogram} />
+            )}
             <div className="grid grid-cols-3 gap-4">
               <Stat
                 label="Duration"
@@ -1110,6 +1274,90 @@ function App() {
                 hint={`${s.min_hrv}–${s.max_hrv}`}
               />
             </div>
+            {sleepSnapshot && (
+              <StageBreakdownBar stages={sleepSnapshot.stages} />
+            )}
+            {sleepSnapshot?.score_components && (
+              <ScoreComponentBars c={sleepSnapshot.score_components} />
+            )}
+            {sleepSnapshot && (
+              <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-zinc-400 tabular-nums">
+                {sleepSnapshot.efficiency != null && (
+                  <span>
+                    Eff{" "}
+                    <span className="text-zinc-200">
+                      {Math.round(sleepSnapshot.efficiency)}%
+                    </span>
+                  </span>
+                )}
+                {sleepSnapshot.latency_min != null && (
+                  <span>
+                    Latency{" "}
+                    <span className="text-zinc-200">
+                      {Math.round(sleepSnapshot.latency_min)}m
+                    </span>
+                  </span>
+                )}
+                {sleepSnapshot.waso_min != null && (
+                  <span>
+                    WASO{" "}
+                    <span className="text-zinc-200">
+                      {Math.round(sleepSnapshot.waso_min)}m
+                    </span>
+                  </span>
+                )}
+                {sleepSnapshot.cycle_count != null && (
+                  <span>
+                    Cycles{" "}
+                    <span className="text-zinc-200">
+                      {sleepSnapshot.cycle_count}
+                    </span>
+                  </span>
+                )}
+                {sleepSnapshot.wake_event_count != null && (
+                  <span>
+                    Wake events{" "}
+                    <span className="text-zinc-200">
+                      {sleepSnapshot.wake_event_count}
+                    </span>
+                  </span>
+                )}
+              </div>
+            )}
+            {sleepSnapshot &&
+              (sleepSnapshot.avg_respiratory_rate != null ||
+                sleepSnapshot.skin_temp_deviation_c != null) && (
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-zinc-400 tabular-nums">
+                  {sleepSnapshot.avg_respiratory_rate != null && (
+                    <span>
+                      Respiratory{" "}
+                      <span className="text-zinc-200">
+                        {sleepSnapshot.avg_respiratory_rate.toFixed(1)} bpm
+                      </span>
+                    </span>
+                  )}
+                  {sleepSnapshot.skin_temp_deviation_c != null && (
+                    <span
+                      className={
+                        Math.abs(sleepSnapshot.skin_temp_deviation_c) > 0.5
+                          ? "text-amber-400"
+                          : undefined
+                      }
+                      title={
+                        Math.abs(sleepSnapshot.skin_temp_deviation_c) > 0.5
+                          ? "Notable deviation from baseline"
+                          : undefined
+                      }
+                    >
+                      Skin temp Δ{" "}
+                      <span className="text-zinc-200">
+                        {sleepSnapshot.skin_temp_deviation_c >= 0 ? "+" : ""}
+                        {sleepSnapshot.skin_temp_deviation_c.toFixed(2)}°C
+                      </span>
+                    </span>
+                  )}
+                </div>
+              )}
           </div>
         ) : (
           <p className="text-xs text-zinc-500">

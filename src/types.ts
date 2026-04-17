@@ -92,3 +92,49 @@ export type ActivitySummary = {
   end: string;
   duration_minutes: number;
 };
+
+// ---- sleep staging (get_sleep_snapshot command) ----
+
+export type SleepStage = "Wake" | "Light" | "Deep" | "REM" | "Unknown";
+
+export type HypnogramEntry = {
+  start: string;
+  end: string;
+  stage: SleepStage;
+};
+
+export type SleepStageTotals = {
+  awake_min: number;
+  light_min: number;
+  deep_min: number;
+  rem_min: number;
+};
+
+export type ScoreComponentsBreakdown = {
+  sufficiency: number;
+  efficiency: number;
+  restorative: number;
+  consistency: number;
+  sleep_stress: number;
+};
+
+export type SleepSnapshot = {
+  sleep_start: string;
+  sleep_end: string;
+  stages: SleepStageTotals;
+  hypnogram: HypnogramEntry[];
+  efficiency: number | null;
+  latency_min: number | null;
+  waso_min: number | null;
+  cycle_count: number | null;
+  wake_event_count: number | null;
+  avg_respiratory_rate: number | null;
+  skin_temp_deviation_c: number | null;
+  performance_score: number | null;
+  sleep_need_hours: number | null;
+  sleep_debt_hours: number | null;
+  score_components: ScoreComponentsBreakdown | null;
+  classifier_version: string | null;
+  /// Nights in the rolling user baseline (<14 = still calibrating).
+  baseline_window_nights: number | null;
+};
