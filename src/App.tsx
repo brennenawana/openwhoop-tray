@@ -236,13 +236,18 @@ function HrvSparkline({ samples }: { samples: HrvSampleLite[] }) {
   );
 }
 
-// Compact list of today's events — timestamp + name. Collapses
-// consecutive duplicates (e.g. back-to-back BatteryLevel pings).
+// Compact two-column table of today's events: 24h time | event name.
+// Collapses consecutive duplicates (e.g. back-to-back BatteryLevel).
+// 24h time (e.g. "14:30") keeps the row to one line and tabular-nums
+// aligns all rows vertically.
 function EventsList({ events }: { events: EventLite[] }) {
   if (events.length === 0) return null;
   const fmt = (iso: string) =>
-    new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  // Dedupe consecutive same-name (keep first of each run).
+    new Date(iso).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
   const deduped: EventLite[] = [];
   let lastName = "";
   for (const e of events) {
@@ -264,20 +269,24 @@ function EventsList({ events }: { events: EventLite[] }) {
       <span className="text-[10px] uppercase tracking-wider text-zinc-500">
         Recent events
       </span>
-      <ul className="flex flex-col gap-0.5 text-[11px] text-zinc-300 tabular-nums">
-        {todayEvents.map((e, i) => (
-          <li key={i} className="flex items-baseline gap-2">
-            <span className="text-zinc-500 w-10">{fmt(e.timestamp)}</span>
-            <span>{e.event_name}</span>
-          </li>
-        ))}
-      </ul>
+      <table className="text-[11px] text-zinc-300 tabular-nums">
+        <tbody>
+          {todayEvents.map((e, i) => (
+            <tr key={i}>
+              <td className="text-zinc-500 pr-3 whitespace-nowrap">
+                {fmt(e.timestamp)}
+              </td>
+              <td className="whitespace-nowrap">{e.event_name}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-// Score components as 5 mini horizontal bars (0–100 each). Compact;
-// renders the composite score's breakdown without a chart library.
+// Score components as 5 stacked horizontal rows, each: label | bar | value.
+// Avoids the label-truncation issue of a 5-column grid at tray width.
 function ScoreComponentBars({ c }: { c: ScoreComponentsBreakdown }) {
   const items: [string, number, string][] = [
     ["Sufficiency", c.sufficiency, "bg-emerald-500"],
@@ -287,23 +296,21 @@ function ScoreComponentBars({ c }: { c: ScoreComponentsBreakdown }) {
     ["Sleep stress", c.sleep_stress, "bg-teal-500"],
   ];
   return (
-    <div className="grid grid-cols-5 gap-2">
+    <div className="flex flex-col gap-1">
       {items.map(([label, value, bg]) => (
-        <div key={label} className="flex flex-col gap-1">
-          <div className="flex items-baseline justify-between gap-1">
-            <span className="text-[10px] text-zinc-500 truncate" title={label}>
-              {label}
-            </span>
-            <span className="text-[10px] text-zinc-300 tabular-nums">
-              {Math.round(value)}
-            </span>
-          </div>
-          <div className="h-1 w-full rounded-full bg-zinc-900 overflow-hidden">
+        <div key={label} className="flex items-center gap-2">
+          <span className="w-[72px] text-[10px] text-zinc-500 flex-shrink-0">
+            {label}
+          </span>
+          <div className="flex-1 h-1 rounded-full bg-zinc-900 overflow-hidden">
             <div
               className={`h-full ${bg}`}
               style={{ width: `${Math.max(0, Math.min(100, value))}%` }}
             />
           </div>
+          <span className="w-6 text-right text-[10px] text-zinc-300 tabular-nums flex-shrink-0">
+            {Math.round(value)}
+          </span>
         </div>
       ))}
     </div>
@@ -1432,7 +1439,7 @@ function App() {
 
       <Section title="Latest sleep">
         {s ? (
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-2">
             <div className="flex items-baseline justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-medium">{s.night}</span>
@@ -1565,42 +1572,6 @@ function App() {
         )}
       </Section>
 
-      {dailySnapshot && (
-        <Section title="Today's activity">
-          <div className="flex flex-col gap-3">
-            {dailySnapshot.today_wear_minutes > 0 && (
-              <div className="flex items-baseline justify-between text-xs">
-                <span className="text-zinc-400">Wear time</span>
-                <span className="text-zinc-200 tabular-nums">
-                  {formatDuration(Math.round(dailySnapshot.today_wear_minutes))}
-                </span>
-              </div>
-            )}
-            {dailySnapshot.today_activity_breakdown &&
-              (dailySnapshot.today_activity_breakdown.sedentary_min +
-                dailySnapshot.today_activity_breakdown.light_min +
-                dailySnapshot.today_activity_breakdown.moderate_min +
-                dailySnapshot.today_activity_breakdown.vigorous_min) >
-                0 && (
-                <ActivityBreakdownBar
-                  b={dailySnapshot.today_activity_breakdown}
-                />
-              )}
-            {dailySnapshot.today_hrv_samples.length > 0 && (
-              <HrvSparkline samples={dailySnapshot.today_hrv_samples} />
-            )}
-            <EventsList events={dailySnapshot.recent_events} />
-            {dailySnapshot.today_wear_minutes === 0 &&
-              dailySnapshot.today_hrv_samples.length === 0 &&
-              dailySnapshot.recent_events.length === 0 && (
-                <p className="text-xs text-zinc-500">
-                  No data today yet. Run <em>detect-events</em> after a sync.
-                </p>
-              )}
-          </div>
-        </Section>
-      )}
-
       <Section title="Last 7 days">
         {w && (w.sleep_nights > 0 || w.workout_count > 0) ? (
           <div className="grid grid-cols-2 gap-4">
@@ -1640,6 +1611,42 @@ function App() {
           <p className="text-xs text-zinc-500">Nothing logged this week.</p>
         )}
       </Section>
+
+      {dailySnapshot && (
+        <Section title="Today's activity">
+          <div className="flex flex-col gap-3">
+            {dailySnapshot.today_wear_minutes > 0 && (
+              <div className="flex items-baseline justify-between text-xs">
+                <span className="text-zinc-400">Wear time</span>
+                <span className="text-zinc-200 tabular-nums">
+                  {formatDuration(Math.round(dailySnapshot.today_wear_minutes))}
+                </span>
+              </div>
+            )}
+            {dailySnapshot.today_activity_breakdown &&
+              (dailySnapshot.today_activity_breakdown.sedentary_min +
+                dailySnapshot.today_activity_breakdown.light_min +
+                dailySnapshot.today_activity_breakdown.moderate_min +
+                dailySnapshot.today_activity_breakdown.vigorous_min) >
+                0 && (
+                <ActivityBreakdownBar
+                  b={dailySnapshot.today_activity_breakdown}
+                />
+              )}
+            {dailySnapshot.today_hrv_samples.length > 0 && (
+              <HrvSparkline samples={dailySnapshot.today_hrv_samples} />
+            )}
+            <EventsList events={dailySnapshot.recent_events} />
+            {dailySnapshot.today_wear_minutes === 0 &&
+              dailySnapshot.today_hrv_samples.length === 0 &&
+              dailySnapshot.recent_events.length === 0 && (
+                <p className="text-xs text-zinc-500">
+                  No data today yet. Run <em>detect-events</em> after a sync.
+                </p>
+              )}
+          </div>
+        </Section>
+      )}
     </main>
   );
 }
