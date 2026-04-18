@@ -319,6 +319,21 @@ async fn get_daily_snapshot(
         .map_err(|e| e.to_string())
 }
 
+/// Phase-3.1 History page: 14-night rollup of sleep cycles + per-day
+/// wear / daytime HRV / activity breakdown. Days argument is clamped
+/// server-side; UI always asks for the default 14-day window today.
+#[tauri::command]
+async fn get_sleep_history(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<openwhoop::sleep_history::SleepHistory, String> {
+    let db = ensure_db(&state).await?;
+    let days = days.unwrap_or(openwhoop::sleep_history::DEFAULT_HISTORY_DAYS);
+    openwhoop::sleep_history::get_sleep_history(&db, days)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------- battery prediction
 
 async fn log_battery_reading(
@@ -878,7 +893,10 @@ async fn run_sync(
     whoop.calculate_stress().await?;
     whoop.calculate_spo2().await?;
     whoop.calculate_skin_temp().await?;
+    whoop.update_wear_periods().await?;
     whoop.stage_sleep().await?;
+    whoop.compute_daytime_hrv().await?;
+    whoop.classify_activities().await?;
 
     let after = heart_rate::Entity::find().count(db.connection()).await? as usize;
     let sleep_nights = db.get_sleep_cycles(None).await?.len();
@@ -1617,6 +1635,7 @@ pub fn run() {
             ring_strap,
             get_sleep_snapshot,
             get_daily_snapshot,
+            get_sleep_history,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

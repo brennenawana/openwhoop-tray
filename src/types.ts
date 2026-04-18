@@ -200,3 +200,36 @@ export type DailySnapshot = {
   alarm_history: AlarmLite[];
   recent_sync_log: SyncLogLite[];
 };
+
+// ---- 14-night history (get_sleep_history command) ----
+
+export type NightEntry = {
+  sleep_id: string;          // YYYY-MM-DD
+  sleep_start: string;
+  sleep_end: string;
+  performance_score: number | null;
+  stages: SleepStageTotals;
+  hypnogram: HypnogramEntry[];
+  sleep_efficiency: number | null;
+  total_sleep_minutes: number | null;
+  sleep_need_hours: number | null;
+  sleep_debt_hours: number | null;
+  avg_hrv: number;
+  classifier_version: string | null;
+};
+
+export type DailyRollup = {
+  date: string;              // YYYY-MM-DD
+  wear_minutes: number;
+  daytime_rmssd_avg: number | null;
+  daytime_rmssd_samples: number;
+  activity: ActivityBreakdown;
+};
+
+export type SleepHistory = {
+  generated_at: string;
+  range_start: string;       // YYYY-MM-DD (inclusive)
+  range_end: string;         // YYYY-MM-DD (inclusive)
+  nights: NightEntry[];
+  daily: DailyRollup[];
+};

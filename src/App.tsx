@@ -16,6 +16,9 @@ import type {
   Snapshot,
 } from "./types";
 import "./App.css";
+import { HistoryView } from "./HistoryView";
+
+type View = "now" | "history";
 
 // Stage → hex color. Matches standard hypnogram convention:
 // REM reddish, Deep dark blue, Light lighter blue, Wake gray,
@@ -789,6 +792,7 @@ function App() {
   const [alarmBusy, setAlarmBusy] = useState<boolean>(false);
   const [alarmInputTouched, setAlarmInputTouched] = useState<boolean>(false);
   const [tick, setTick] = useState(0);
+  const [view, setView] = useState<View>("now");
   // tick increments every 30s so the "Next sync in Xm" label re-renders
   useEffect(() => {
     const i = setInterval(() => setTick((t) => t + 1), 30_000);
@@ -1164,6 +1168,23 @@ function App() {
         </div>
       </header>
 
+      <nav className="flex items-center gap-1 -mt-2 text-[11px]">
+        {(["now", "history"] as const).map((v) => (
+          <button
+            key={v}
+            onClick={() => setView(v)}
+            className={
+              "rounded-full px-3 py-1 uppercase tracking-wider transition-colors " +
+              (view === v
+                ? "bg-zinc-800/80 text-zinc-100"
+                : "text-zinc-500 hover:text-zinc-300")
+            }
+          >
+            {v === "now" ? "Now" : "History"}
+          </button>
+        ))}
+      </nav>
+
       {showSettings && (
         <div className="flex flex-col gap-4 rounded-md border border-zinc-800 bg-zinc-950/60 p-3">
           <div className="flex flex-col gap-2">
@@ -1384,6 +1405,10 @@ function App() {
           );
         })()}
 
+      {view === "history" && <HistoryView visible={view === "history"} />}
+
+      {view === "now" && (
+      <>
       <Section title="Today">
         {t && t.sample_count > 0 ? (
           <>
@@ -1660,6 +1685,8 @@ function App() {
               )}
           </div>
         </Section>
+      )}
+      </>
       )}
     </main>
   );
