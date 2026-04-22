@@ -3654,6 +3654,7 @@ dependencies = [
  "anyhow",
  "btleplug",
  "chrono",
+ "futures",
  "openwhoop",
  "openwhoop-algos",
  "openwhoop-codec",
@@ -3668,6 +3669,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-opener",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

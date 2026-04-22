@@ -16,7 +16,7 @@
         "title": "OpenWhoop",
         "width": 420,
         "height": 620,
-        "resizable": false,
+        "resizable": true,
         "fullscreen": false,
         "decorations": true,
         "transparent": false,

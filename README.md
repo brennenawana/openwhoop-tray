@@ -1,8 +1,34 @@
 # OpenWhoop Tray
 
+> **Credit & attribution**
+>
+> This project is an **add-on** — a macOS menu bar front-end — built on top of
+> [**bWanShiTong/openwhoop**](https://github.com/bWanShiTong/openwhoop).
+>
+> All of the hard work — the reverse-engineered WHOOP Bluetooth protocol, the
+> sync pipeline, the local SQLite schema, and every health algorithm
+> (sleep staging, strain, HRV, recovery, stress) — lives in that upstream
+> project by [**@bWanShiTong**](https://github.com/bWanShiTong). This
+> repository would not exist without it.
+>
+> `openwhoop-tray` only adds a Tauri/React UI, a tray/menu-bar shell, a
+> presence-based auto-sync scheduler, and a few glue commands on top of the
+> upstream Rust crates (vendored as a git submodule under `vendor/openwhoop/`).
+> If you're looking for the protocol, the library, or CLI usage, go there.
+>
+> **Note on the submodule:** `vendor/openwhoop` currently tracks my personal
+> fork [`brennenawana/openwhoop`](https://github.com/brennenawana/openwhoop)
+> on the `whoop-tray` branch, not the upstream `bWanShiTong/openwhoop` master.
+> The fork carries a handful of tray-specific integration patches (extra
+> Tauri-facing APIs, a WHOOP-aligned recovery score module, etc.) that haven't
+> been upstreamed yet. If/when they land upstream, the submodule will be
+> repointed at `bWanShiTong/openwhoop` directly.
+
+---
+
 A macOS menu bar companion for your WHOOP strap. Syncs data over Bluetooth, processes sleep/stress/strain metrics locally, and keeps everything on your machine — no cloud, no WHOOP subscription required.
 
-Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com/bWanShiTong/openwhoop) Rust library.
+Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com/bWanShiTong/openwhoop) Rust library by [@bWanShiTong](https://github.com/bWanShiTong).
 
 ## Features
 

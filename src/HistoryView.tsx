@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
   DailyRollup,
@@ -8,15 +15,29 @@ import {
   SleepStage,
 } from "./types";
 
-// Matches App.tsx STAGE_COLOR exactly so the thumbnail hypnograms in the
-// History view read the same as the Latest Sleep strip on the Now view.
+// Theme-aware stage colors. The CSS variables are defined in App.css and
+// flip to darker shades under `[data-theme="light"]` so the thumbnails
+// stay legible on near-white backgrounds. Keeping the lookup as a Record
+// so call sites don't change.
 const STAGE_COLOR: Record<SleepStage, string> = {
-  Wake: "#71717a",
-  Light: "#60a5fa",
-  Deep: "#1e3a8a",
-  REM: "#f472b6",
-  Unknown: "#3f3f46",
+  Wake: "var(--stage-wake)",
+  Light: "var(--stage-light)",
+  REM: "var(--stage-rem)",
+  Deep: "var(--stage-deep)",
+  Unknown: "var(--stage-unknown)",
 };
+
+const ACTIVITY_COLOR = {
+  sedentary: "#475569", // slate-600
+  light: "#22d3ee", // cyan-400
+  moderate: "#fbbf24", // amber-400
+  vigorous: "#f472b6", // pink-400
+} as const;
+
+const WEAR_COLOR = "#10b981"; // emerald-500
+const SCORE_LINE_COLOR = "#fb7185"; // rose-400
+const SLEEP_HRV_COLOR = "#818cf8"; // indigo-400
+const DAYTIME_HRV_COLOR = "#5eead4"; // teal-300
 
 function fmtDateShort(iso: string): string {
   const d = new Date(iso + "T00:00:00");
@@ -33,47 +54,154 @@ function fmtDateWeekday(iso: string): string {
   return d.toLocaleDateString([], { weekday: "short" });
 }
 
-/** One night's hypnogram rendered as a narrow thumbnail column. */
-function HypnogramThumb({ hypnogram }: { hypnogram: HypnogramEntry[] }) {
-  if (hypnogram.length === 0) {
-    return <div className="h-10 w-full rounded-sm bg-zinc-900" />;
-  }
-  const t0 = new Date(hypnogram[0].start).getTime();
-  const t1 = new Date(hypnogram[hypnogram.length - 1].end).getTime();
-  const total = Math.max(t1 - t0, 1);
+// Returns the "night of" date (YYYY-MM-DD) for a given bedtime, using the
+// convention that a post-midnight start belongs to the prior evening.
+// Mirrors the backend's `build_sleep_section` shift so labels match.
+function nightOf(sleepStart: string): string {
+  const t = new Date(sleepStart).getTime() - 12 * 60 * 60 * 1000;
+  const d = new Date(t);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function fmtMinutes(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  if (h <= 0) return `${m}m`;
+  return `${h}h ${m.toString().padStart(2, "0")}m`;
+}
+
+/** Animated skeleton shown while the 14-night history fetch is in flight.
+ * Uses Tailwind's `animate-pulse` on placeholder blocks matching the
+ * real section layout so the page doesn't look frozen. */
+function HistorySkeleton() {
   return (
-    <div className="flex h-10 w-full overflow-hidden rounded-sm bg-zinc-900">
-      {hypnogram.map((h, i) => {
-        const start = new Date(h.start).getTime();
-        const end = new Date(h.end).getTime();
-        const width = ((end - start) / total) * 100;
-        return (
-          <div
-            key={i}
-            style={{
-              width: `${width}%`,
-              backgroundColor: STAGE_COLOR[h.stage as SleepStage] ?? "#4b5563",
-            }}
-            title={`${h.stage} · ${new Date(h.start).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-            })}`}
-          />
-        );
-      })}
-    </div>
+    <section className="flex flex-col gap-5 pb-4 animate-pulse">
+      <div className="flex items-baseline justify-between">
+        <div className="h-4 w-32 rounded bg-zinc-800" />
+        <div className="h-3 w-28 rounded bg-zinc-800/70" />
+      </div>
+      {/* Score trend */}
+      <div className="flex flex-col gap-1">
+        <div className="h-3 w-24 rounded bg-zinc-800/70" />
+        <div className="h-14 w-full rounded bg-zinc-900" />
+      </div>
+      {/* Stage composition */}
+      <div className="flex flex-col gap-1">
+        <div className="h-3 w-28 rounded bg-zinc-800/70" />
+        <div className="h-12 w-full rounded bg-zinc-900" />
+      </div>
+      {/* Hypnograms */}
+      <div className="flex flex-col gap-1">
+        <div className="h-3 w-24 rounded bg-zinc-800/70" />
+        <div className="flex flex-col gap-[2px]">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <div className="h-3 w-14 rounded bg-zinc-800/70" />
+              <div className="h-6 flex-1 rounded-sm bg-zinc-900" />
+              <div className="h-3 w-10 rounded bg-zinc-800/70" />
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* HRV + wear */}
+      <div className="flex flex-col gap-1">
+        <div className="h-3 w-24 rounded bg-zinc-800/70" />
+        <div className="h-14 w-full rounded bg-zinc-900" />
+      </div>
+      <div className="flex flex-col gap-1">
+        <div className="h-3 w-28 rounded bg-zinc-800/70" />
+        <div className="h-10 w-full rounded bg-zinc-900" />
+      </div>
+      <p className="text-[10px] text-zinc-600 text-center">
+        Loading last 14 nights…
+      </p>
+    </section>
   );
 }
 
-/** Score trend — inline SVG line chart, one point per night. */
+/** Fractional bar height per stage for the thumbnail "skyline" view.
+ *
+ * Height doubles as a visual weight for *recovery contribution*: Deep
+ * sits at the top (biggest block), then REM, then Light, with Wake
+ * nearly flat. This makes restorative sleep legible at a glance even
+ * at 24px row height and in any theme — colored blocks carry enough
+ * mass that they don't depend on thin-line contrast. */
+const STAGE_DEPTH: Record<SleepStage, number> = {
+  Wake: 0.18,
+  Light: 0.42,
+  REM: 0.68,
+  Deep: 1.0,
+  Unknown: 0.08,
+};
+
+/** One night's hypnogram rendered as a compact "skyline" thumbnail.
+ *
+ * Each timeline slice is a filled rectangle whose height encodes sleep
+ * depth and whose color encodes stage. Tall indigo blocks = deep sleep
+ * (front-loaded nights are obvious). Short slate dips = wake events.
+ *
+ * This replaces the earlier stepped-line thumbnail which had poor
+ * visual weight at small scale, especially against light-theme
+ * near-white backgrounds. */
+function HypnogramThumb({ hypnogram }: { hypnogram: HypnogramEntry[] }) {
+  if (hypnogram.length === 0) {
+    return (
+      <div className="h-6 w-full rounded-sm bg-zinc-800/40" />
+    );
+  }
+
+  const VB_W = 400;
+  const VB_H = 24;
+  const padT = 1;
+  const padB = 1;
+  const chartH = VB_H - padT - padB;
+
+  const t0 = new Date(hypnogram[0].start).getTime();
+  const t1 = new Date(hypnogram[hypnogram.length - 1].end).getTime();
+  const tSpan = Math.max(1, t1 - t0);
+  const x = (time: number) => ((time - t0) / tSpan) * VB_W;
+
+  return (
+    <svg
+      viewBox={`0 0 ${VB_W} ${VB_H}`}
+      preserveAspectRatio="none"
+      className="h-6 w-full rounded-sm bg-zinc-800/40"
+    >
+      {hypnogram.map((h, i) => {
+        const x0 = x(new Date(h.start).getTime());
+        const x1v = x(new Date(h.end).getTime());
+        const depth = STAGE_DEPTH[h.stage as SleepStage] ?? STAGE_DEPTH.Unknown;
+        const rh = chartH * depth;
+        const w = Math.max(0.5, x1v - x0);
+        return (
+          <rect
+            key={i}
+            x={x0}
+            y={VB_H - padB - rh}
+            width={w}
+            height={rh}
+            fill={STAGE_COLOR[h.stage as SleepStage] ?? STAGE_COLOR.Unknown}
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
+/** Score trend — inline SVG line chart with interactive hover tooltip. */
 function ScoreTrend({ nights }: { nights: NightEntry[] }) {
+  const [hovered, setHovered] = useState<number | null>(null);
+
   const points = nights
-    .map((n, i) => ({
-      x: i,
+    .map((n) => ({
       y: n.performance_score ?? null,
-      label: n.sleep_id,
+      label: nightOf(n.sleep_start),
     }))
-    .filter((p): p is { x: number; y: number; label: string } => p.y != null);
+    .filter((p): p is { y: number; label: string } => p.y != null)
+    .map((p, i) => ({ ...p, x: i }));
 
   if (points.length < 2) {
     return (
@@ -86,10 +214,9 @@ function ScoreTrend({ nights }: { nights: NightEntry[] }) {
   const width = 320;
   const height = 60;
   const pad = 4;
-  const xs = points.map((p) => p.x);
   const ys = points.map((p) => p.y);
-  const xMin = Math.min(...xs);
-  const xMax = Math.max(...xs);
+  const xMin = 0;
+  const xMax = points.length - 1;
   const yMin = Math.min(...ys, 40);
   const yMax = Math.max(...ys, 100);
   const xScale = (x: number) =>
@@ -102,6 +229,7 @@ function ScoreTrend({ nights }: { nights: NightEntry[] }) {
     .join(" ");
 
   const avg = ys.reduce((s, y) => s + y, 0) / ys.length;
+  const latest = points[points.length - 1];
 
   return (
     <div className="flex flex-col gap-1">
@@ -109,43 +237,90 @@ function ScoreTrend({ nights }: { nights: NightEntry[] }) {
         <span className="text-[10px] uppercase tracking-wider text-zinc-500">
           Score trend
         </span>
-        <span className="text-[10px] text-zinc-500 tabular-nums">
-          avg {avg.toFixed(0)}
+        <span className="flex items-center gap-3 text-[10px] text-zinc-500 tabular-nums">
+          <span>
+            latest{" "}
+            <span className="text-zinc-200">{latest.y.toFixed(0)}</span>
+          </span>
+          <span>
+            avg <span className="text-zinc-200">{avg.toFixed(0)}</span>
+          </span>
         </span>
       </div>
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="none"
-        className="w-full h-14"
-      >
-        <line
-          x1={pad}
-          x2={width - pad}
-          y1={yScale(avg)}
-          y2={yScale(avg)}
-          stroke="#3f3f46"
-          strokeDasharray="2,2"
-        />
-        <path d={path} stroke="#fb7185" strokeWidth={1.5} fill="none" />
-        {points.map((p, i) => (
-          <circle
-            key={i}
-            cx={xScale(p.x)}
-            cy={yScale(p.y)}
-            r={2}
-            fill="#fb7185"
+      <div className="relative">
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          preserveAspectRatio="none"
+          className="w-full h-14"
+        >
+          <line
+            x1={pad}
+            x2={width - pad}
+            y1={yScale(avg)}
+            y2={yScale(avg)}
+            stroke="var(--color-zinc-700)"
+            strokeDasharray="2,2"
+            vectorEffect="non-scaling-stroke"
+          />
+          <path
+            d={path}
+            stroke={SCORE_LINE_COLOR}
+            strokeWidth={1.5}
+            fill="none"
+            vectorEffect="non-scaling-stroke"
+          />
+          {points.map((p, i) => (
+            <g key={i}>
+              {/* enlarged invisible hit area for easier hovering */}
+              <circle
+                cx={xScale(p.x)}
+                cy={yScale(p.y)}
+                r={10}
+                fill="transparent"
+                onMouseEnter={() => setHovered(i)}
+                onMouseLeave={() => setHovered(null)}
+                style={{ cursor: "pointer" }}
+              />
+              <circle
+                cx={xScale(p.x)}
+                cy={yScale(p.y)}
+                r={hovered === i ? 3.5 : 2}
+                fill={SCORE_LINE_COLOR}
+                stroke={hovered === i ? "#fff" : "none"}
+                strokeWidth={0.5}
+                pointerEvents="none"
+              />
+            </g>
+          ))}
+        </svg>
+        {hovered !== null && (
+          <ChartTooltip
+            leftPct={(xScale(points[hovered].x) / width) * 100}
+            topPct={(yScale(points[hovered].y) / height) * 100}
           >
-            <title>
-              {fmtDateDay(p.label)} · {p.y.toFixed(0)}
-            </title>
-          </circle>
-        ))}
-      </svg>
+            <div className="text-[10px] font-medium text-zinc-200">
+              {fmtDateDay(points[hovered].label)}
+            </div>
+            <div className="flex items-center gap-1.5 text-[10px]">
+              <span
+                className="inline-block h-1.5 w-1.5 rounded-full"
+                style={{ backgroundColor: SCORE_LINE_COLOR }}
+              />
+              <span className="text-zinc-400">Score</span>
+              <span className="text-zinc-100 tabular-nums">
+                {points[hovered].y.toFixed(0)}
+              </span>
+            </div>
+          </ChartTooltip>
+        )}
+      </div>
     </div>
   );
 }
 
-/** HRV line: sleep-window avg HRV (solid) + daytime daytime_rmssd_avg (dashed). */
+/** HRV trend — sleep-window HRV (solid) + daytime HRV (dashed) with
+ * explicit Y-axis bounds so the numbers are legible. Latest values are
+ * surfaced in the header. */
 function HrvTrend({
   nights,
   daily,
@@ -171,14 +346,16 @@ function HrvTrend({
   const width = 320;
   const height = 60;
   const pad = 4;
-  // Combined Y range across both series for comparable axes.
   const allY = [
     ...sleepPoints.map((p) => p.value),
     ...daytimePoints.map((p) => p.value),
   ];
-  const yMin = Math.min(...allY);
-  const yMax = Math.max(...allY);
-  // X-axis is day index within `daily`. sleep points key off their date.
+  const yMinRaw = Math.min(...allY);
+  const yMaxRaw = Math.max(...allY);
+  // Add 10% headroom on each side so the lines don't graze the edges.
+  const yPad = Math.max(1, (yMaxRaw - yMinRaw) * 0.1);
+  const yMin = Math.max(0, yMinRaw - yPad);
+  const yMax = yMaxRaw + yPad;
   const dateIdx = new Map(daily.map((d, i) => [d.date, i]));
   const xMax = Math.max(daily.length - 1, 1);
   const xScale = (i: number) => pad + (i / xMax) * (width - pad * 2);
@@ -196,88 +373,164 @@ function HrvTrend({
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.x)} ${yScale(p.y)}`)
     .join(" ");
 
+  const latestSleep = sleepPoints[sleepPoints.length - 1];
+  const latestDaytime = daytimePoints[daytimePoints.length - 1];
+
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-baseline justify-between">
         <span className="text-[10px] uppercase tracking-wider text-zinc-500">
-          HRV trend
+          HRV trend (ms)
         </span>
-        <span className="flex items-center gap-2 text-[9px] text-zinc-500">
-          <span className="inline-flex items-center gap-1">
-            <span className="inline-block h-px w-3 bg-indigo-400" />
-            sleep
-          </span>
-          <span className="inline-flex items-center gap-1">
-            <span
-              className="inline-block h-px w-3 bg-teal-300"
-              style={{
-                backgroundImage:
-                  "linear-gradient(to right, #5eead4 50%, transparent 50%)",
-                backgroundSize: "4px 1px",
-              }}
-            />
-            daytime
-          </span>
+        <span className="flex items-center gap-3 text-[10px] text-zinc-500 tabular-nums">
+          {latestSleep && (
+            <span className="inline-flex items-center gap-1">
+              <span
+                className="inline-block h-px w-3"
+                style={{ backgroundColor: SLEEP_HRV_COLOR }}
+              />
+              <span className="text-zinc-400">sleep</span>
+              <span className="text-zinc-100">
+                {Math.round(latestSleep.value)}
+              </span>
+            </span>
+          )}
+          {latestDaytime && (
+            <span className="inline-flex items-center gap-1">
+              <span
+                className="inline-block h-px w-3"
+                style={{
+                  backgroundImage: `linear-gradient(to right, ${DAYTIME_HRV_COLOR} 50%, transparent 50%)`,
+                  backgroundSize: "4px 1px",
+                }}
+              />
+              <span className="text-zinc-400">day</span>
+              <span className="text-zinc-100">
+                {Math.round(latestDaytime.value)}
+              </span>
+            </span>
+          )}
         </span>
       </div>
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="none"
-        className="w-full h-14"
-      >
-        {sleepPath && (
-          <path d={sleepPath} stroke="#818cf8" strokeWidth={1.5} fill="none" />
-        )}
-        {daytimePath && (
-          <path
-            d={daytimePath}
-            stroke="#5eead4"
-            strokeWidth={1.5}
-            strokeDasharray="3,2"
-            fill="none"
-          />
-        )}
-      </svg>
+      <div className="flex items-stretch gap-2">
+        <div className="flex flex-col justify-between py-0.5 text-[9px] text-zinc-600 tabular-nums select-none">
+          <span>{Math.round(yMax)}</span>
+          <span>{Math.round(yMin)}</span>
+        </div>
+        <div className="relative flex-1">
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            preserveAspectRatio="none"
+            className="w-full h-14"
+          >
+            {/* faint baseline + midline */}
+            <line
+              x1={pad}
+              x2={width - pad}
+              y1={yScale(yMin)}
+              y2={yScale(yMin)}
+              stroke="var(--color-zinc-800)"
+              strokeWidth={0.5}
+              vectorEffect="non-scaling-stroke"
+            />
+            <line
+              x1={pad}
+              x2={width - pad}
+              y1={yScale((yMin + yMax) / 2)}
+              y2={yScale((yMin + yMax) / 2)}
+              stroke="var(--color-zinc-800)"
+              strokeWidth={0.5}
+              strokeDasharray="2,3"
+              vectorEffect="non-scaling-stroke"
+            />
+            {sleepPath && (
+              <path
+                d={sleepPath}
+                stroke={SLEEP_HRV_COLOR}
+                strokeWidth={1.5}
+                fill="none"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+            {daytimePath && (
+              <path
+                d={daytimePath}
+                stroke={DAYTIME_HRV_COLOR}
+                strokeWidth={1.5}
+                strokeDasharray="3,2"
+                fill="none"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </svg>
+        </div>
+      </div>
     </div>
   );
 }
 
-/** Per-day wear + activity stacked-bar row. One bar per calendar day. */
+/** Daily activity + wear time chart with clearer labeling. */
 function WearActivityRow({ daily }: { daily: DailyRollup[] }) {
+  const [hovered, setHovered] = useState<number | null>(null);
   const maxMinutes = 24 * 60;
+
+  // Cumulative window totals give the user a sense of whether activity
+  // is "low" in absolute terms vs just "low-looking on a 24h scale."
+  const totals = daily.reduce(
+    (acc, d) => {
+      acc.sedentary += d.activity.sedentary_min;
+      acc.light += d.activity.light_min;
+      acc.moderate += d.activity.moderate_min;
+      acc.vigorous += d.activity.vigorous_min;
+      // Cap per-day wear at 24h. The backend's `wear_minutes_in_range`
+      // sums the full duration of every wear period that intersects the
+      // day (not the per-day overlap), so overlapping rows can push a
+      // day's total past 24h. Clamp here so the summary doesn't show
+      // nonsense like "1355h/day."
+      acc.wear += Math.min(d.wear_minutes, maxMinutes);
+      return acc;
+    },
+    { sedentary: 0, light: 0, moderate: 0, vigorous: 0, wear: 0 },
+  );
+  const activeWindowMin = totals.light + totals.moderate + totals.vigorous;
+  const wearDays = daily.length;
+  const avgWearHoursPerDay = wearDays > 0 ? totals.wear / 60 / wearDays : 0;
+
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1.5">
       <div className="flex items-baseline justify-between">
         <span className="text-[10px] uppercase tracking-wider text-zinc-500">
-          Wear + activity
+          Daily activity + wear time
         </span>
         <span className="text-[9px] text-zinc-600">
-          sedentary · light · moderate · vigorous
+          bar = 24h · green = hours worn
         </span>
       </div>
-      <div className="grid gap-[2px]" style={{ gridTemplateColumns: `repeat(${daily.length}, 1fr)` }}>
-        {daily.map((d) => {
+      <div
+        className="relative grid gap-[2px]"
+        style={{ gridTemplateColumns: `repeat(${daily.length}, 1fr)` }}
+      >
+        {daily.map((d, i) => {
           const a = d.activity;
-          const total =
-            a.sedentary_min + a.light_min + a.moderate_min + a.vigorous_min;
+          const activeMin = a.light_min + a.moderate_min + a.vigorous_min;
+          const wearPct = Math.min(
+            100,
+            Math.max(0, (d.wear_minutes / maxMinutes) * 100),
+          );
           return (
             <div
               key={d.date}
-              className="flex flex-col gap-[2px]"
-              title={`${fmtDateDay(d.date)} · wear ${(d.wear_minutes / 60).toFixed(
-                1,
-              )}h · activity ${total.toFixed(0)}m`}
+              className="flex flex-col gap-[2px] cursor-pointer"
+              onMouseEnter={() => setHovered(i)}
+              onMouseLeave={() => setHovered(null)}
+              aria-label={`activity breakdown for ${d.date}`}
             >
-              <div
-                className="h-8 w-full rounded-sm bg-zinc-900 overflow-hidden flex flex-col justify-end"
-                aria-label={`activity breakdown for ${d.date}`}
-              >
-                {/* Stack bottom-up so vigorous sits at top. */}
+              <div className="h-10 w-full rounded-sm bg-zinc-900 overflow-hidden flex flex-col justify-end">
                 {a.sedentary_min > 0 && (
                   <div
                     style={{
                       height: `${(a.sedentary_min / maxMinutes) * 100}%`,
-                      backgroundColor: "#475569",
+                      backgroundColor: ACTIVITY_COLOR.sedentary,
                     }}
                   />
                 )}
@@ -285,7 +538,7 @@ function WearActivityRow({ daily }: { daily: DailyRollup[] }) {
                   <div
                     style={{
                       height: `${(a.light_min / maxMinutes) * 100}%`,
-                      backgroundColor: "#22d3ee",
+                      backgroundColor: ACTIVITY_COLOR.light,
                     }}
                   />
                 )}
@@ -293,7 +546,7 @@ function WearActivityRow({ daily }: { daily: DailyRollup[] }) {
                   <div
                     style={{
                       height: `${(a.moderate_min / maxMinutes) * 100}%`,
-                      backgroundColor: "#fbbf24",
+                      backgroundColor: ACTIVITY_COLOR.moderate,
                     }}
                   />
                 )}
@@ -301,33 +554,222 @@ function WearActivityRow({ daily }: { daily: DailyRollup[] }) {
                   <div
                     style={{
                       height: `${(a.vigorous_min / maxMinutes) * 100}%`,
-                      backgroundColor: "#f472b6",
+                      backgroundColor: ACTIVITY_COLOR.vigorous,
                     }}
                   />
                 )}
               </div>
-              <div className="h-[3px] w-full rounded-sm bg-zinc-900">
+              <div className="h-[3px] w-full rounded-sm bg-zinc-900 overflow-hidden">
                 <div
-                  className="h-full rounded-sm bg-emerald-500/70"
-                  style={{ width: `${(d.wear_minutes / maxMinutes) * 100}%` }}
-                  aria-label={`wear minutes for ${d.date}`}
+                  className="h-full rounded-sm"
+                  style={{
+                    width: `${wearPct}%`,
+                    backgroundColor: WEAR_COLOR,
+                    opacity: 0.75,
+                  }}
                 />
               </div>
+              <span className="block text-[9px] text-center text-zinc-600 tabular-nums">
+                {fmtDateWeekday(d.date).slice(0, 1)}
+              </span>
+              {hovered === i && (
+                <ChartTooltip
+                  leftPct={((i + 0.5) / daily.length) * 100}
+                  topPct={10}
+                >
+                  <div className="text-[10px] font-medium text-zinc-200">
+                    {fmtDateDay(d.date)}
+                  </div>
+                  <div className="text-[10px] text-zinc-400">
+                    wear {(Math.min(d.wear_minutes, maxMinutes) / 60).toFixed(1)}h
+                    {" · "}active {Math.round(activeMin)}m
+                  </div>
+                  <div className="mt-1 flex flex-col gap-0.5 text-[10px]">
+                    <TooltipRow
+                      color={ACTIVITY_COLOR.vigorous}
+                      label="Vigorous"
+                      value={`${Math.round(a.vigorous_min)}m`}
+                    />
+                    <TooltipRow
+                      color={ACTIVITY_COLOR.moderate}
+                      label="Moderate"
+                      value={`${Math.round(a.moderate_min)}m`}
+                    />
+                    <TooltipRow
+                      color={ACTIVITY_COLOR.light}
+                      label="Light"
+                      value={`${Math.round(a.light_min)}m`}
+                    />
+                    <TooltipRow
+                      color={ACTIVITY_COLOR.sedentary}
+                      label="Sedentary"
+                      value={`${Math.round(a.sedentary_min)}m`}
+                    />
+                  </div>
+                </ChartTooltip>
+              )}
             </div>
           );
         })}
       </div>
-      <div
-        className="grid text-[9px] text-zinc-600 tabular-nums"
-        style={{ gridTemplateColumns: `repeat(${daily.length}, 1fr)` }}
-      >
-        {daily.map((d) => (
-          <span key={d.date} className="text-center">
-            {fmtDateWeekday(d.date).slice(0, 1)}
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-zinc-400">
+        <LegendSwatch color={ACTIVITY_COLOR.vigorous} label="Vigorous" />
+        <LegendSwatch color={ACTIVITY_COLOR.moderate} label="Moderate" />
+        <LegendSwatch color={ACTIVITY_COLOR.light} label="Light" />
+        <LegendSwatch color={ACTIVITY_COLOR.sedentary} label="Sedentary" />
+        <LegendSwatch color={WEAR_COLOR} label="Wear time" />
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-zinc-500 tabular-nums">
+        <span>
+          Active (light+): {" "}
+          <span className="text-zinc-200">{fmtMinutes(activeWindowMin)}</span>{" "}
+          / {wearDays}d
+        </span>
+        <span>
+          Vigorous:{" "}
+          <span className="text-zinc-200">
+            {fmtMinutes(totals.vigorous)}
           </span>
-        ))}
+        </span>
+        <span>
+          Avg wear:{" "}
+          <span className="text-zinc-200">
+            {avgWearHoursPerDay.toFixed(1)}h
+          </span>
+          /day
+        </span>
       </div>
     </div>
+  );
+}
+
+function LegendSwatch({ color, label }: { color: string; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span
+        className="inline-block h-2 w-2 rounded-sm"
+        style={{ backgroundColor: color }}
+      />
+      {label}
+    </span>
+  );
+}
+
+function TooltipRow({
+  color,
+  label,
+  value,
+}: {
+  color: string;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span
+        className="inline-block h-1.5 w-1.5 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+      <span className="text-zinc-400 flex-1">{label}</span>
+      <span className="text-zinc-100 tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+/** Generic chart tooltip: absolute-positioned by percent within its
+ * relative-positioned parent. `topPct` is the Y position of the anchor;
+ * the tooltip floats ABOVE that point with a 12px gap. Pointer events
+ * disabled so it never steals a hover from the underlying chart. */
+/** Generic chart tooltip.
+ *
+ * Rendered through a React portal onto the document body so no parent
+ * `overflow-hidden` / `overflow-x-hidden` can clip it, and positioned
+ * in fixed-viewport coordinates. On mount it measures itself with
+ * `useLayoutEffect` and clamps to the viewport: centered above the
+ * anchor by default, flipped below if there's no room above, and
+ * nudged sideways if it would otherwise escape left or right. */
+function ChartTooltip({
+  leftPct,
+  topPct,
+  children,
+}: {
+  leftPct: number;
+  topPct: number;
+  children: React.ReactNode;
+}) {
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const tipRef = useRef<HTMLDivElement>(null);
+  const [style, setStyle] = useState<React.CSSProperties>({
+    position: "fixed",
+    top: 0,
+    left: 0,
+    opacity: 0,
+  });
+
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current;
+    const parent = anchor?.parentElement;
+    const tip = tipRef.current;
+    if (!anchor || !parent || !tip) return;
+
+    const pr = parent.getBoundingClientRect();
+    const tipRect = tip.getBoundingClientRect();
+    const ax = pr.left + (pr.width * leftPct) / 100;
+    const ay = pr.top + (pr.height * topPct) / 100;
+
+    const PAD = 8;
+    const GAP = 8;
+
+    // Default: centered above the anchor.
+    let x = ax - tipRect.width / 2;
+    let y = ay - tipRect.height - GAP;
+
+    // Flip below if above doesn't fit.
+    if (y < PAD) y = ay + GAP;
+
+    // Clamp horizontally within the viewport.
+    if (x < PAD) x = PAD;
+    if (x + tipRect.width > window.innerWidth - PAD) {
+      x = window.innerWidth - PAD - tipRect.width;
+    }
+
+    // Clamp vertically to the bottom edge as a last resort.
+    if (y + tipRect.height > window.innerHeight - PAD) {
+      y = window.innerHeight - PAD - tipRect.height;
+    }
+
+    setStyle({
+      position: "fixed",
+      left: x,
+      top: y,
+      opacity: 1,
+    });
+  }, [leftPct, topPct]);
+
+  return (
+    <>
+      <span
+        ref={anchorRef}
+        aria-hidden
+        style={{
+          position: "absolute",
+          left: `${leftPct}%`,
+          top: `${topPct}%`,
+          width: 0,
+          height: 0,
+        }}
+      />
+      {createPortal(
+        <div
+          ref={tipRef}
+          className="z-50 rounded-md border border-zinc-700 bg-zinc-900/95 backdrop-blur px-2 py-1.5 shadow-lg pointer-events-none"
+          style={{ minWidth: "120px", ...style }}
+        >
+          {children}
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 
@@ -352,7 +794,7 @@ function HypnogramRow({ nights }: { nights: NightEntry[] }) {
             className="flex items-center gap-2"
           >
             <span className="w-14 shrink-0 text-[10px] text-zinc-500 tabular-nums">
-              {fmtDateShort(n.sleep_id)}
+              {fmtDateShort(nightOf(n.sleep_start))}
             </span>
             <div className="flex-1">
               <HypnogramThumb hypnogram={n.hypnogram} />
@@ -369,9 +811,11 @@ function HypnogramRow({ nights }: { nights: NightEntry[] }) {
   );
 }
 
-/** Stage composition stacked-bar row: one bar per night, stacked by stage minutes. */
+/** Stage composition stacked-bar row with custom hover tooltip. */
 function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
+  const [hovered, setHovered] = useState<number | null>(null);
   if (nights.length === 0) return null;
+
   const maxTotal = Math.max(
     ...nights.map(
       (n) =>
@@ -379,26 +823,24 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
     ),
     1,
   );
+
   return (
     <div className="flex flex-col gap-1">
       <span className="text-[10px] uppercase tracking-wider text-zinc-500">
         Stage composition
       </span>
       <div
-        className="grid gap-[2px]"
+        className="relative grid gap-[2px]"
         style={{ gridTemplateColumns: `repeat(${nights.length}, 1fr)` }}
       >
-        {nights.map((n) => {
+        {nights.map((n, i) => {
           const s = n.stages;
           return (
             <div
               key={`${n.sleep_id}-${n.sleep_start}`}
-              className="flex h-12 flex-col justify-end overflow-hidden rounded-sm bg-zinc-900"
-              title={`${fmtDateDay(n.sleep_id)} · light ${s.light_min.toFixed(
-                0,
-              )}m · deep ${s.deep_min.toFixed(0)}m · rem ${s.rem_min.toFixed(
-                0,
-              )}m · awake ${s.awake_min.toFixed(0)}m`}
+              className="flex h-12 flex-col justify-end overflow-hidden rounded-sm bg-zinc-900 cursor-pointer"
+              onMouseEnter={() => setHovered(i)}
+              onMouseLeave={() => setHovered(null)}
             >
               {s.awake_min > 0 && (
                 <div
@@ -435,6 +877,46 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
             </div>
           );
         })}
+        {hovered !== null && (() => {
+          const n = nights[hovered];
+          const s = n.stages;
+          const total = s.awake_min + s.light_min + s.deep_min + s.rem_min;
+          return (
+            <ChartTooltip
+              leftPct={((hovered + 0.5) / nights.length) * 100}
+              topPct={0}
+            >
+              <div className="text-[10px] font-medium text-zinc-200">
+                {fmtDateDay(nightOf(n.sleep_start))}
+              </div>
+              <div className="text-[10px] text-zinc-400">
+                total {fmtMinutes(total)}
+              </div>
+              <div className="mt-1 flex flex-col gap-0.5 text-[10px]">
+                <TooltipRow
+                  color={STAGE_COLOR.Deep}
+                  label="Deep"
+                  value={fmtMinutes(s.deep_min)}
+                />
+                <TooltipRow
+                  color={STAGE_COLOR.REM}
+                  label="REM"
+                  value={fmtMinutes(s.rem_min)}
+                />
+                <TooltipRow
+                  color={STAGE_COLOR.Light}
+                  label="Light"
+                  value={fmtMinutes(s.light_min)}
+                />
+                <TooltipRow
+                  color={STAGE_COLOR.Wake}
+                  label="Wake"
+                  value={fmtMinutes(s.awake_min)}
+                />
+              </div>
+            </ChartTooltip>
+          );
+        })()}
       </div>
       <div
         className="grid text-[9px] text-zinc-600 tabular-nums"
@@ -442,7 +924,7 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
       >
         {nights.map((n) => (
           <span key={`${n.sleep_id}-${n.sleep_start}`} className="text-center">
-            {fmtDateWeekday(n.sleep_id).slice(0, 1)}
+            {fmtDateWeekday(nightOf(n.sleep_start)).slice(0, 1)}
           </span>
         ))}
       </div>
@@ -493,21 +975,15 @@ export function HistoryView({ visible }: { visible: boolean }) {
   }
 
   if (loading && !history) {
-    return (
-      <section className="flex flex-col gap-3">
-        <p className="text-xs text-zinc-500">Loading last 14 nights…</p>
-      </section>
-    );
+    return <HistorySkeleton />;
   }
 
   if (!history) return null;
 
   return (
-    <section className="flex flex-col gap-5 pb-4">
+    <section className="flex flex-col gap-5 pb-4 min-w-0 max-w-full">
       <div className="flex items-baseline justify-between">
-        <h2 className="text-sm font-medium text-zinc-200">
-          Last 14 nights
-        </h2>
+        <h2 className="text-sm font-medium text-zinc-200">Last 14 nights</h2>
         <span className="text-[10px] text-zinc-500 tabular-nums">
           {fmtDateDay(history.range_start)} → {fmtDateDay(history.range_end)}
         </span>

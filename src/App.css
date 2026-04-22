@@ -10,13 +10,124 @@
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "cv11", "ss01", "ss03";
+
+  /* Default theme: monokai — warm dim grey, not pitch black. Every surface
+     color used in the UI maps onto Tailwind's zinc-* scale, so we override
+     that scale here and individual themes only need to redefine these vars. */
+  --app-bg: #272822;
+  --app-fg: #f8f8f2;
+  --color-zinc-50:  #fafaf7;
+  --color-zinc-100: #f8f8f2;
+  --color-zinc-200: #e8e8e0;
+  --color-zinc-300: #c8c8bf;
+  --color-zinc-400: #a6a69a;
+  --color-zinc-500: #8a8778;
+  --color-zinc-600: #6b6857;
+  --color-zinc-700: #49483e;
+  --color-zinc-800: #3e3d32;
+  --color-zinc-900: #2d2e27;
+  --color-zinc-950: #22231d;
+
+  /* Hypnogram stage colors. Default (dark themes): soft saturated
+     tones tuned for dark surfaces. Light-mode override below darkens
+     them so they don't disappear on near-white backgrounds. */
+  --stage-wake: #94a3b8;   /* slate-400 */
+  --stage-light: #7dd3fc;  /* sky-300 */
+  --stage-rem: #c084fc;    /* purple-400 */
+  --stage-deep: #4338ca;   /* indigo-700 */
+  --stage-unknown: #3f3f46;
+  --stage-connector: #3f3f46;
+}
+
+[data-theme="midnight"] {
+  /* Original pitch-black — highest contrast, what the app shipped with. */
+  --app-bg: #0a0a0c;
+  --app-fg: #e7e7ea;
+  --color-zinc-50:  #fafafa;
+  --color-zinc-100: #f4f4f5;
+  --color-zinc-200: #e4e4e7;
+  --color-zinc-300: #d4d4d8;
+  --color-zinc-400: #a1a1aa;
+  --color-zinc-500: #71717a;
+  --color-zinc-600: #52525b;
+  --color-zinc-700: #3f3f46;
+  --color-zinc-800: #27272a;
+  --color-zinc-900: #18181b;
+  --color-zinc-950: #09090b;
+}
+
+[data-theme="slate"] {
+  /* Cool neutral grey — somewhere between monokai warmth and midnight depth. */
+  --app-bg: #1e2128;
+  --app-fg: #e2e8f0;
+  --color-zinc-50:  #f8fafc;
+  --color-zinc-100: #f1f5f9;
+  --color-zinc-200: #e2e8f0;
+  --color-zinc-300: #cbd5e1;
+  --color-zinc-400: #94a3b8;
+  --color-zinc-500: #64748b;
+  --color-zinc-600: #475569;
+  --color-zinc-700: #334155;
+  --color-zinc-800: #2a2f3a;
+  --color-zinc-900: #1e2128;
+  --color-zinc-950: #161820;
+}
+
+[data-theme="light"] {
+  /* Light mode — zinc scale is inverted so existing `bg-zinc-900`/`text-zinc-500`
+     utilities map onto light surfaces and darker text. Accent *-300 text colors
+     used on tinted backdrops (error/success toasts, "Calibrating" badge, etc.)
+     flip to the corresponding *-700 shades so contrast remains readable, and the
+     `*-950`/`*-900` accent surface/border scales flip to the lightest tints. */
+  color-scheme: light;
+  --app-bg: #fafaf7;
+  --app-fg: #1a1a1c;
+  --color-zinc-50:  #18181b;
+  --color-zinc-100: #27272a;
+  --color-zinc-200: #3f3f46;
+  --color-zinc-300: #52525b;
+  --color-zinc-400: #52525b;
+  --color-zinc-500: #6b6b75;
+  --color-zinc-600: #9a9aa3;
+  --color-zinc-700: #d4d4d8;
+  --color-zinc-800: #e4e4e7;
+  --color-zinc-900: #f4f4f5;
+  --color-zinc-950: #fafafa;
+
+  --color-rose-300: #be123c;
+  --color-rose-400: #e11d48;
+  --color-rose-500: #be123c;
+  --color-rose-600: #9f1239;
+  --color-rose-900: #fecdd3;
+  --color-rose-950: #fff1f2;
+
+  --color-emerald-300: #047857;
+  --color-emerald-400: #059669;
+  --color-emerald-900: #a7f3d0;
+  --color-emerald-950: #ecfdf5;
+
+  --color-amber-300: #b45309;
+  --color-amber-400: #d97706;
+
+  --color-sky-400: #0369a1;
+
+  /* Stage colors darkened for light backgrounds. The dark-theme defaults
+     (sky-300, slate-400, etc.) wash out against near-white; these darker
+     shades keep each stage band readable and preserve the slate → sky →
+     violet → indigo hue gradient. */
+  --stage-wake: #475569;   /* slate-600 */
+  --stage-light: #0284c7;  /* sky-600 */
+  --stage-rem: #9333ea;    /* purple-600 */
+  --stage-deep: #312e81;   /* indigo-900 */
+  --stage-unknown: #a1a1aa;
+  --stage-connector: #a1a1aa;
 }
 
 html,
 body,
 #root {
   height: 100%;
-  background: #0a0a0c;
-  color: #e7e7ea;
+  background: var(--app-bg);
+  color: var(--app-fg);
   margin: 0;
 }
