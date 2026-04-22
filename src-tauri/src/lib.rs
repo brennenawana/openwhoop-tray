@@ -18,7 +18,9 @@ use openwhoop_algos::{
 use openwhoop_codec::{
     WhoopData, WhoopPacket,
     constants::{
-        CMD_TO_STRAP, CommandNumber, DATA_FROM_STRAP, PacketType, WHOOP_SERVICE,
+        CMD_TO_STRAP_GEN4 as CMD_TO_STRAP, CommandNumber,
+        DATA_FROM_STRAP_GEN4 as DATA_FROM_STRAP, PacketType,
+        WHOOP_SERVICE_GEN4 as WHOOP_SERVICE, WhoopGeneration,
     },
 };
 use openwhoop_db::DatabaseHandler;
@@ -818,7 +820,7 @@ async fn do_ring_strap(app: AppHandle) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
     let peripheral = scan_for_device(&adapter, &device_name).await?;
-    let mut device = WhoopDevice::new(peripheral, adapter, db, false);
+    let mut device = WhoopDevice::new(peripheral, adapter, db, false, WhoopGeneration::Gen4);
     device.connect().await?;
     device.send_command(WhoopPacket::run_alarm()).await?;
 
@@ -867,13 +869,13 @@ async fn do_alarm_op(app: AppHandle, op: AlarmOp) -> anyhow::Result<AlarmStatus>
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
     let peripheral = scan_for_device(&adapter, &device_name).await?;
-    let mut device = WhoopDevice::new(peripheral, adapter, db, false);
+    let mut device = WhoopDevice::new(peripheral, adapter, db, false, WhoopGeneration::Gen4);
     device.connect().await?;
 
     // Apply the change. set/clear don't return useful responses, so we
     // always follow with get_alarm to confirm.
     if let AlarmOp::Set(unix) = op {
-        device.send_command(WhoopPacket::alarm_time(unix)).await?;
+        device.send_command(WhoopPacket::alarm_time(unix, WhoopGeneration::Gen4)).await?;
     }
     if matches!(op, AlarmOp::Clear) {
         device.send_command(WhoopPacket::disable_alarm()).await?;
@@ -1178,7 +1180,7 @@ async fn run_sync(
     *app.state::<AppState>().strap_seen_at.write().await = Some(Local::now().naive_local());
 
     emit_progress(app, "connecting");
-    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false);
+    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false, WhoopGeneration::Gen4);
     device.connect().await?;
     device.initialize().await?;
 
@@ -1229,7 +1231,9 @@ async fn run_sync(
         }
     });
 
-    let sync_result = device.sync_history(cancel.clone()).await;
+    let sync_result = device
+        .sync_history(cancel.clone(), openwhoop::HistorySyncConfig::default())
+        .await;
     progress_task.abort();
     timeout_task.abort();
     sync_result?;
@@ -1286,7 +1290,7 @@ async fn run_sync(
     }
 
     emit_progress(app, "processing");
-    let whoop = OpenWhoop::new(db.clone());
+    let whoop = OpenWhoop::new(db.clone(), WhoopGeneration::Gen4);
     whoop.detect_sleeps().await?;
     whoop.detect_events().await?;
     whoop.calculate_stress().await?;
