@@ -2,6 +2,7 @@ export type Snapshot = {
   generated_at: string;
   today: TodaySection;
   latest_sleep: SleepSection | null;
+  recovery: RecoverySection | null;
   week: WeekSection;
   recent_activities: ActivitySummary[];
   battery: BatteryInfo | null;
@@ -12,6 +13,33 @@ export type Snapshot = {
   strap_seen_at: string | null;
   alarm: AlarmStatus | null;
   battery_estimate: BatteryEstimate | null;
+};
+
+export type RecoveryBand = "red" | "yellow" | "green";
+export type RecoveryDriver =
+  | "hrv"
+  | "rhr"
+  | "sleep"
+  | "rr"
+  | "skin_temp"
+  | "none";
+
+export type RecoverySection = {
+  score: number;
+  band: RecoveryBand;
+  dominant_driver: RecoveryDriver;
+  for_sleep_id: string; // YYYY-MM-DD
+  baseline_window_nights: number;
+  calibrating: boolean;
+  z_hrv: number | null;
+  z_rhr: number | null;
+  z_sleep: number | null;
+  z_rr: number | null;
+  z_skin_temp: number | null;
+  hrv_rmssd_ms: number | null;
+  /** 0–100 score of current HRV against published age-matched
+   * population RMSSD norms. Null when no DOB is configured. */
+  age_normed_hrv_score: number | null;
 };
 
 export type BatteryEstimate = {
@@ -30,6 +58,10 @@ export type BackendConfig = {
   device_name: string | null;
   sync_interval_minutes: number | null;
   presence_interval_minutes: number | null;
+  dob: string | null; // YYYY-MM-DD
+  /** When true, recent sleep surplus reduces tonight's sleep need
+   * (Rupp 2009 "banking"). WHOOP does not expose this; default off. */
+  allow_surplus_banking: boolean;
 };
 
 export type DiscoveredDevice = {

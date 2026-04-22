@@ -1,16 +1,28 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{
+    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+};
 use btleplug::platform::{Adapter, Manager, Peripheral};
-use chrono::{Local, NaiveDateTime, TimeDelta, Timelike};
+use chrono::{Local, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
+use futures::StreamExt;
 use openwhoop::{OpenWhoop, WhoopDevice};
-use openwhoop_algos::{SleepConsistencyAnalyzer, SleepCycle};
-use openwhoop_codec::{WhoopData, WhoopPacket, constants::WHOOP_SERVICE};
+use openwhoop_algos::{
+    RecoveryBand, RecoveryDriver, RecoveryNight, SleepConsistencyAnalyzer, SleepCycle,
+    age_normed_hrv_score, compute_recovery,
+};
+use openwhoop_codec::{
+    WhoopData, WhoopPacket,
+    constants::{
+        CMD_TO_STRAP, CommandNumber, DATA_FROM_STRAP, PacketType, WHOOP_SERVICE,
+    },
+};
 use openwhoop_db::DatabaseHandler;
-use openwhoop_entities::{battery_log, heart_rate};
+use openwhoop_entities::{battery_log, heart_rate, sleep_cycles};
 use openwhoop_types::activities::{ActivityPeriod, ActivityType, SearchActivityPeriods};
 use sea_orm::{
     ActiveValue::NotSet, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
@@ -36,6 +48,17 @@ struct Config {
     /// Minutes between presence scans. None = default (2), Some(0) = off.
     #[serde(default)]
     presence_interval_minutes: Option<u32>,
+    /// Date of birth — used to age-norm the HRV ring against published
+    /// population HRV distributions. Optional: without a DOB the HRV
+    /// ring falls back to just the raw ms value with no 0–100 score.
+    #[serde(default)]
+    dob: Option<NaiveDate>,
+    /// When true, recent sleep *surplus* (slept more than need)
+    /// reduces tonight's sleep need (Rupp 2009 "banking"). WHOOP's
+    /// user-facing number doesn't do this, so the default is off.
+    /// See docs/SLEEP_STAGING.md for the science.
+    #[serde(default)]
+    allow_surplus_banking: bool,
 }
 
 /// Returns Some(minutes) if presence scans are enabled, None if disabled.
@@ -83,6 +106,8 @@ struct AppState {
     strap_seen_at: RwLock<Option<NaiveDateTime>>,
     ble_lock: Arc<Mutex<()>>,
     alarm: RwLock<Option<AlarmStatus>>,
+    live_active: Arc<AtomicBool>,
+    live_cancel: Arc<Notify>,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -122,6 +147,7 @@ struct Snapshot {
     generated_at: NaiveDateTime,
     today: TodaySection,
     latest_sleep: Option<SleepSection>,
+    recovery: Option<RecoverySection>,
     week: WeekSection,
     recent_activities: Vec<ActivitySummary>,
     battery: Option<BatteryInfo>,
@@ -132,6 +158,34 @@ struct Snapshot {
     strap_seen_at: Option<NaiveDateTime>,
     alarm: Option<AlarmStatus>,
     battery_estimate: Option<BatteryEstimate>,
+}
+
+#[derive(Serialize, Clone)]
+struct RecoverySection {
+    score: f64,
+    /// "red" | "yellow" | "green"
+    band: &'static str,
+    /// "hrv" | "rhr" | "sleep" | "rr" | "skin_temp" | "none"
+    dominant_driver: &'static str,
+    /// Which night this recovery was computed for (the wake date).
+    for_sleep_id: NaiveDate,
+    /// How many prior nights contributed to the baseline (≤14).
+    baseline_window_nights: usize,
+    calibrating: bool,
+    /// Per-metric z-scores (positive = better for recovery). Useful for
+    /// debugging and for a future drill-in view.
+    z_hrv: Option<f64>,
+    z_rhr: Option<f64>,
+    z_sleep: Option<f64>,
+    z_rr: Option<f64>,
+    z_skin_temp: Option<f64>,
+    /// Raw RMSSD (ms) from this night — surfaced so the HRV ring can
+    /// show the underlying number alongside the age-normed score.
+    hrv_rmssd_ms: Option<f64>,
+    /// HRV score against age-matched population norms (0–100). `None`
+    /// when no DOB is configured — the HRV ring then falls back to
+    /// displaying just the raw ms.
+    age_normed_hrv_score: Option<f64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -244,6 +298,11 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         Some(b) if !b.charging => estimate_battery_remaining(&db, b.percent).await,
         _ => None,
     };
+    let age_years = {
+        let cfg = state.config.read().await;
+        cfg.dob
+            .and_then(|d| Local::now().naive_local().date().years_since(d))
+    };
     build_snapshot(
         &db,
         battery,
@@ -254,6 +313,7 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         strap_seen_at,
         alarm,
         battery_estimate,
+        age_years,
     )
     .await
     .map_err(|e| e.to_string())
@@ -285,6 +345,159 @@ async fn clear_alarm(app: AppHandle) -> Result<AlarmStatus, String> {
 #[tauri::command]
 async fn ring_strap(app: AppHandle) -> Result<(), String> {
     do_ring_strap(app).await.map_err(|e| e.to_string())
+}
+
+#[derive(Serialize, Clone)]
+struct LiveSample {
+    bpm: u8,
+    raw_hex: String,
+    ts: NaiveDateTime,
+}
+
+#[tauri::command]
+async fn start_live_stream(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if state.live_active.load(Ordering::SeqCst) {
+        return Err("Live stream already running".into());
+    }
+    if *state.sync_in_progress.read().await {
+        return Err("Sync in progress — try again in a moment".into());
+    }
+    if state.config.read().await.device_name.is_none() {
+        return Err("Set a device name first.".into());
+    }
+
+    state.live_active.store(true, Ordering::SeqCst);
+    let app_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = run_live_stream(app_task.clone()).await;
+        let state = app_task.state::<AppState>();
+        state.live_active.store(false, Ordering::SeqCst);
+        match result {
+            Ok(()) => {
+                let _ = app_task.emit("live:stopped", ());
+            }
+            Err(e) => {
+                let _ = app_task.emit("live:error", e.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_live_stream(state: State<'_, AppState>) -> Result<(), String> {
+    state.live_cancel.notify_waiters();
+    Ok(())
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+fn whoop_char(uuid: uuid::Uuid) -> Characteristic {
+    Characteristic {
+        uuid,
+        service_uuid: WHOOP_SERVICE,
+        properties: CharPropFlags::empty(),
+        descriptors: BTreeSet::new(),
+    }
+}
+
+async fn run_live_stream(app: AppHandle) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    let device_name = state
+        .config
+        .read()
+        .await
+        .device_name
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Device not configured"))?;
+    let cancel = state.live_cancel.clone();
+
+    let _ble_guard = state.ble_lock.clone().lock_owned().await;
+    let _ = app.emit("live:starting", ());
+
+    let manager = Manager::new().await?;
+    let adapter = manager
+        .adapters()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
+
+    let peripheral = scan_for_device(&adapter, &device_name).await?;
+    peripheral.connect().await?;
+    let _ = adapter.stop_scan().await;
+    peripheral.discover_services().await?;
+
+    let data_char = whoop_char(DATA_FROM_STRAP);
+    let cmd_char = whoop_char(CMD_TO_STRAP);
+
+    peripheral.subscribe(&data_char).await?;
+
+    let enable = WhoopPacket::new(
+        PacketType::Command,
+        0,
+        CommandNumber::ToggleRealtimeHr.as_u8(),
+        vec![0x01],
+    )
+    .framed_packet()?;
+    peripheral
+        .write(&cmd_char, &enable, WriteType::WithoutResponse)
+        .await?;
+
+    let mut notifications = peripheral.notifications().await?;
+
+    *state.strap_seen_at.write().await = Some(Local::now().naive_local());
+    let _ = app.emit("live:started", ());
+
+    let stream_result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+                _ = cancel.notified() => break,
+                notif = notifications.next() => {
+                    let Some(notif) = notif else { break };
+                    if notif.uuid != DATA_FROM_STRAP { continue; }
+                    let raw = notif.value.clone();
+                    let Ok(packet) = WhoopPacket::from_data(notif.value) else { continue; };
+                    if packet.packet_type != PacketType::RealtimeData { continue; }
+                    if packet.data.len() < 6 { continue; }
+                    let bpm = packet.data[5];
+                    let sample = LiveSample {
+                        bpm,
+                        raw_hex: bytes_to_hex(&raw),
+                        ts: Local::now().naive_local(),
+                    };
+                    let _ = app.emit("live_sample", sample);
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // Best-effort: disable the stream and disconnect so we don't leave the
+    // strap transmitting in the background.
+    if let Ok(disable) = WhoopPacket::new(
+        PacketType::Command,
+        0,
+        CommandNumber::ToggleRealtimeHr.as_u8(),
+        vec![0x00],
+    )
+    .framed_packet()
+    {
+        let _ = peripheral
+            .write(&cmd_char, &disable, WriteType::WithoutResponse)
+            .await;
+    }
+    let _ = peripheral.disconnect().await;
+
+    stream_result
 }
 
 /// Return the full sleep-staging snapshot for the most recent cycle.
@@ -374,22 +587,65 @@ async fn estimate_battery_remaining(
         return None;
     }
 
-    // Walk backward from newest until we hit a charging=true row — that's
-    // the start of the current discharge cycle. Only use non-charging
-    // readings for the regression.
-    let mut discharge: Vec<(f64, f64)> = Vec::new(); // (hours_since_first, percent)
-    let mut anchor_time = None;
+    // (time, percent, charging) triples, newest first.
+    let triples: Vec<(chrono::NaiveDateTime, f64, bool)> = rows
+        .iter()
+        .map(|r| (r.time, r.percent, r.charging))
+        .collect();
+    estimate_from_readings(&triples, f64::from(current_percent))
+}
 
-    for row in rows.iter().rev() {
-        if row.charging {
-            // Reset — new discharge cycle starts after this.
-            discharge.clear();
-            anchor_time = None;
-            continue;
+/// Cycle ends when we see a jump UP of > this many percent between
+/// adjacent (newer → older) readings — interpreted as a charge we
+/// missed because the tray wasn't running or the strap didn't emit a
+/// charging-flagged reading during the charge window.
+const CHARGE_JUMP_THRESHOLD: f64 = 2.0;
+
+/// Cap the discharge window at this many hours of real time. Drain
+/// rate shifts with usage pattern, and the most recent window best
+/// predicts the next few hours. Spec is ~5 d at ~0.83%/h, so 18 h
+/// of recent data is enough for a stable slope without being so
+/// old that it washes out the current rate.
+const MAX_WINDOW_HOURS: f64 = 18.0;
+
+/// Pure: fit a drain rate from a newest-first sequence of readings
+/// and project hours remaining at `current_percent`. Stops at
+/// charging rows or missed-charge jumps. Returns `None` when
+/// fewer than 2 usable points or non-draining slope.
+fn estimate_from_readings(
+    readings: &[(chrono::NaiveDateTime, f64, bool)],
+    current_percent: f64,
+) -> Option<BatteryEstimate> {
+    if readings.len() < 2 {
+        return None;
+    }
+
+    let mut discharge: Vec<(f64, f64)> = Vec::new();
+    let now_time = readings[0].0;
+    let mut prev_pct: Option<f64> = None;
+    for &(t, pct, charging) in readings {
+        if charging {
+            break;
         }
-        let t = *anchor_time.get_or_insert(row.time);
-        let hours = (row.time - t).num_seconds() as f64 / 3600.0;
-        discharge.push((hours, row.percent));
+        let hours_ago = (now_time - t).num_seconds() as f64 / 3600.0;
+        if hours_ago > MAX_WINDOW_HOURS {
+            break;
+        }
+        if let Some(prev) = prev_pct {
+            // `row` is older than the previously-seen row. If the OLDER
+            // row's percent is BELOW the newer row by more than the
+            // threshold, that means the newer reading was post-charge
+            // — stop before including this older-cycle data.
+            if prev - pct > CHARGE_JUMP_THRESHOLD {
+                break;
+            }
+        }
+        // Flip sign so slope has conventional units: drain makes
+        // slope negative (percent decreasing as hours_since_start
+        // increases).
+        let hours_since_start = -hours_ago;
+        discharge.push((hours_since_start, pct));
+        prev_pct = Some(pct);
     }
 
     if discharge.len() < 2 {
@@ -397,7 +653,6 @@ async fn estimate_battery_remaining(
     }
 
     // Simple linear regression: percent = a + b * hours.
-    // b (slope) is the drain rate (negative = draining).
     let n = discharge.len() as f64;
     let sum_x: f64 = discharge.iter().map(|(x, _)| x).sum();
     let sum_y: f64 = discharge.iter().map(|(_, y)| y).sum();
@@ -410,15 +665,12 @@ async fn estimate_battery_remaining(
     }
     let slope = (n * sum_xy - sum_x * sum_y) / denom;
 
-    // slope should be negative (battery draining). If ≤ 0, drain_rate
-    // is the absolute value. If positive, battery is somehow increasing
-    // which doesn't make sense for a discharge model.
     let drain_rate = -slope;
     if drain_rate <= 0.01 {
         return None;
     }
 
-    let hours_remaining = f64::from(current_percent) / drain_rate;
+    let hours_remaining = current_percent / drain_rate;
 
     let confidence = match discharge.len() {
         0..=5 => "low",
@@ -432,6 +684,107 @@ async fn estimate_battery_remaining(
         data_points: discharge.len(),
         confidence,
     })
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::*;
+    use chrono::{Duration, NaiveDate, NaiveDateTime};
+
+    fn t(mins_ago_from_anchor: i64) -> NaiveDateTime {
+        // Anchor at 2026-04-22 17:00 and subtract minutes.
+        let anchor = NaiveDate::from_ymd_opt(2026, 4, 22)
+            .unwrap()
+            .and_hms_opt(17, 0, 0)
+            .unwrap();
+        anchor - Duration::minutes(mins_ago_from_anchor)
+    }
+
+    #[test]
+    fn linear_discharge_yields_expected_hours() {
+        // 1%/hour drain, currently at 10%. Expect ~10 h remaining.
+        let readings: Vec<_> = (0..10)
+            .map(|i| (t(i * 60), 10.0 + i as f64, false))
+            .collect();
+        let est = estimate_from_readings(&readings, 10.0).unwrap();
+        assert!((est.drain_rate_pct_per_hour - 1.0).abs() < 0.05);
+        assert!((est.hours_remaining - 10.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn missed_charge_jump_is_detected() {
+        // Reading sequence (newest first):
+        //   5%, 6%, 7%, 8%  (current cycle, ~1%/hr drain)
+        //   — hidden charge event here —
+        //   2%, 3% (yesterday's tail — strap drained to near-empty
+        //            before the charge we didn't capture)
+        //
+        // Going from the 8% (newer) to 2% (older) is a jump of +6
+        // percent above 2% threshold → should end the cycle.
+        let readings = vec![
+            (t(0), 5.0, false),
+            (t(60), 6.0, false),
+            (t(120), 7.0, false),
+            (t(180), 8.0, false),
+            (t(240), 2.0, false), // prev(8) − row(2) = 6 > 2 → cycle ends
+            (t(300), 3.0, false),
+        ];
+        let est = estimate_from_readings(&readings, 5.0).unwrap();
+        // Drain rate should reflect only the 5–8% cycle → ~1%/hr.
+        assert!(
+            (est.drain_rate_pct_per_hour - 1.0).abs() < 0.2,
+            "drain rate should be ~1%/hr, got {}",
+            est.drain_rate_pct_per_hour
+        );
+        assert_eq!(est.data_points, 4);
+        // 5% ÷ ~1%/hr ≈ 5 hours remaining, not the smeared-regression
+        // result of over 50h.
+        assert!(est.hours_remaining < 10.0);
+    }
+
+    #[test]
+    fn charging_flag_ends_cycle() {
+        let readings = vec![
+            (t(0), 50.0, false),
+            (t(60), 51.0, false),
+            (t(120), 80.0, true), // charging — stop here
+            (t(180), 85.0, false),
+        ];
+        let est = estimate_from_readings(&readings, 50.0).unwrap();
+        // Only 2 points ingested (before the charging row).
+        assert_eq!(est.data_points, 2);
+    }
+
+    #[test]
+    fn window_cap_excludes_old_readings() {
+        // 20h of data: first half drains at 2%/h, second half at 0.5%/h.
+        // MAX_WINDOW_HOURS = 18, so the oldest 2h should be trimmed.
+        // (In fact with these values the first ~18h of readings drop in.)
+        let mut readings = Vec::new();
+        for i in 0..20 {
+            readings.push((t(i * 60), 50.0 + i as f64 * 0.5, false));
+        }
+        let est = estimate_from_readings(&readings, 50.0).unwrap();
+        // Ensure we capped the window.
+        assert!(est.data_points <= 19);
+    }
+
+    #[test]
+    fn rising_battery_without_charging_flag_returns_none() {
+        // Newer = higher % than older = battery was gaining over time.
+        // This shouldn't happen without a charge event, but if the
+        // `charging` bit is unreliable, a below-threshold jump-up
+        // can sneak through. Regression slope is positive → drain
+        // rate is negative → we refuse to predict.
+        let rising = vec![
+            (t(0), 51.0, false),
+            (t(60), 50.0, false),
+        ];
+        assert!(
+            estimate_from_readings(&rising, 51.0).is_none(),
+            "rising battery without charging flag should return None",
+        );
+    }
 }
 
 /// Connect, fire the strap's haptic alarm, disconnect. No response handling —
@@ -604,6 +957,28 @@ async fn set_sync_interval(
 }
 
 #[tauri::command]
+async fn set_allow_surplus_banking(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let path = state
+        .config_path
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "config path not initialized".to_string())?;
+    {
+        let mut cfg = state.config.write().await;
+        cfg.allow_surplus_banking = enabled;
+        cfg.save(&path).map_err(|e| e.to_string())?;
+    }
+    // Next sync will re-run staging with the new flag (via
+    // stage_sleep_with_opts once the vendor/openwhoop submodule is
+    // bumped to the commit that introduced StageSleepOptions).
+    Ok(())
+}
+
+#[tauri::command]
 async fn set_presence_interval(
     state: State<'_, AppState>,
     minutes: Option<u32>,
@@ -620,6 +995,27 @@ async fn set_presence_interval(
         cfg.save(&path).map_err(|e| e.to_string())?;
     }
     state.presence_notify.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_dob(state: State<'_, AppState>, iso: Option<String>) -> Result<(), String> {
+    // iso is "YYYY-MM-DD"; None / empty clears the setting.
+    let dob = match iso.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => Some(
+            NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| format!("invalid date: {e}"))?,
+        ),
+    };
+    let path = state
+        .config_path
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "config path not initialized".to_string())?;
+    let mut cfg = state.config.write().await;
+    cfg.dob = dob;
+    cfg.save(&path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -694,6 +1090,9 @@ async fn sync_now(app: AppHandle) -> Result<SyncReport, String> {
 
 async fn do_sync_guarded(app: AppHandle) -> anyhow::Result<SyncReport> {
     let state = app.state::<AppState>();
+    if state.live_active.load(Ordering::SeqCst) {
+        anyhow::bail!("Live stream is running — stop it before syncing");
+    }
     {
         let mut flag = state.sync_in_progress.write().await;
         if *flag {
@@ -894,6 +1293,11 @@ async fn run_sync(
     whoop.calculate_spo2().await?;
     whoop.calculate_skin_temp().await?;
     whoop.update_wear_periods().await?;
+    // Surplus-banking flag is persisted in config but not yet passed
+    // through — the `stage_sleep_with_opts` entry point lives on
+    // openwhoop master d44fe45 and isn't in the currently-pinned
+    // submodule. Bump vendor/openwhoop to pick it up, then switch
+    // this to `stage_sleep_with_opts(StageSleepOptions { ... })`.
     whoop.stage_sleep().await?;
     whoop.compute_daytime_hrv().await?;
     whoop.classify_activities().await?;
@@ -993,6 +1397,7 @@ async fn build_snapshot(
     strap_seen_at: Option<NaiveDateTime>,
     alarm: Option<AlarmStatus>,
     battery_estimate: Option<BatteryEstimate>,
+    age_years: Option<u32>,
 ) -> anyhow::Result<Snapshot> {
     let now = Local::now().naive_local();
     let today = now.date();
@@ -1029,10 +1434,18 @@ async fn build_snapshot(
         })
         .collect();
 
+    let recovery = build_recovery_section(db, age_years)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("openwhoop-tray: recovery computation failed: {}", e);
+            None
+        });
+
     Ok(Snapshot {
         generated_at: now,
         today: build_today(&today_rows, hr_series),
         latest_sleep: sleep_cycles.last().map(build_sleep_section),
+        recovery,
         week: build_week(&sleep_cycles, &recent_activities, week_start)?,
         recent_activities: build_activity_list(&recent_activities),
         battery,
@@ -1044,6 +1457,74 @@ async fn build_snapshot(
         alarm,
         battery_estimate,
     })
+}
+
+/// Fetch the most recent sleep cycle + up to 14 prior nights for baseline,
+/// then run the recovery algorithm. Returns `None` if no cycles exist or
+/// the baseline is too short to produce a meaningful score.
+async fn build_recovery_section(
+    db: &DatabaseHandler,
+    age_years: Option<u32>,
+) -> anyhow::Result<Option<RecoverySection>> {
+    // Most-recent first. Fetch 15 = 1 current + 14 baseline.
+    let rows: Vec<sleep_cycles::Model> = sleep_cycles::Entity::find()
+        .order_by_desc(sleep_cycles::Column::Start)
+        .limit(15)
+        .all(db.connection())
+        .await?;
+
+    let Some((current, baseline_rows)) = rows.split_first() else {
+        return Ok(None);
+    };
+
+    let to_night = |m: &sleep_cycles::Model| RecoveryNight {
+        hrv_rmssd_ms: f64::from(m.avg_hrv),
+        rhr_bpm: f64::from(m.min_bpm.max(0)),
+        avg_resp_rate: m.avg_respiratory_rate,
+        sleep_performance_score: m.performance_score,
+        skin_temp_deviation_c: m.skin_temp_deviation_c,
+    };
+
+    let today = to_night(current);
+    let baseline: Vec<RecoveryNight> = baseline_rows.iter().map(to_night).collect();
+
+    let Some(r) = compute_recovery(&today, &baseline) else {
+        return Ok(None);
+    };
+
+    let band = match r.band {
+        RecoveryBand::Red => "red",
+        RecoveryBand::Yellow => "yellow",
+        RecoveryBand::Green => "green",
+    };
+    let dominant_driver = match r.dominant_driver {
+        RecoveryDriver::Hrv => "hrv",
+        RecoveryDriver::Rhr => "rhr",
+        RecoveryDriver::Sleep => "sleep",
+        RecoveryDriver::Rr => "rr",
+        RecoveryDriver::SkinTemp => "skin_temp",
+        RecoveryDriver::None => "none",
+    };
+
+    let hrv_rmssd_ms = Some(f64::from(current.avg_hrv)).filter(|v| *v > 0.0);
+    let age_normed =
+        age_years.and_then(|age| hrv_rmssd_ms.map(|ms| age_normed_hrv_score(ms, age)));
+
+    Ok(Some(RecoverySection {
+        score: r.score,
+        band,
+        dominant_driver,
+        for_sleep_id: current.sleep_id,
+        baseline_window_nights: r.baseline_window_nights,
+        calibrating: r.calibrating,
+        z_hrv: r.z_scores.hrv,
+        z_rhr: r.z_scores.rhr,
+        z_sleep: r.z_scores.sleep,
+        z_rr: r.z_scores.rr,
+        z_skin_temp: r.z_scores.skin_temp,
+        hrv_rmssd_ms,
+        age_normed_hrv_score: age_normed,
+    }))
 }
 
 fn build_today(rows: &[heart_rate::Model], series_rows: Vec<HrPoint>) -> TodaySection {
@@ -1103,8 +1584,11 @@ fn build_today(rows: &[heart_rate::Model], series_rows: Vec<HrPoint>) -> TodaySe
 
 fn build_sleep_section(s: &SleepCycle) -> SleepSection {
     let duration = (s.end - s.start).num_minutes();
+    // "Night of" = the evening the user went to bed. Shifting bedtime back 12h
+    // maps a post-midnight start (e.g. 01:12 Sun) to the prior evening (Sat).
+    let night_of = (s.start - TimeDelta::hours(12)).date();
     SleepSection {
-        night: s.id.format("%a %b %d").to_string(),
+        night: night_of.format("%a %b %d").to_string(),
         start: s.start,
         end: s.end,
         duration_minutes: duration,
@@ -1522,6 +2006,8 @@ pub fn run() {
             strap_seen_at: RwLock::new(None),
             ble_lock: Arc::new(Mutex::new(())),
             alarm: RwLock::new(None),
+            live_active: Arc::new(AtomicBool::new(false)),
+            live_cancel: Arc::new(Notify::new()),
         })
         .setup(|app| {
             // Config path: ~/Library/Application Support/dev.brennen.openwhoop-tray/config.json
@@ -1626,6 +2112,8 @@ pub fn run() {
             set_device_name,
             set_sync_interval,
             set_presence_interval,
+            set_dob,
+            set_allow_surplus_banking,
             scan_devices,
             get_autostart,
             set_autostart,
@@ -1636,6 +2124,8 @@ pub fn run() {
             get_sleep_snapshot,
             get_daily_snapshot,
             get_sleep_history,
+            start_live_stream,
+            stop_live_stream,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
