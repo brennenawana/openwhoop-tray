@@ -1293,12 +1293,14 @@ async fn run_sync(
     whoop.calculate_spo2().await?;
     whoop.calculate_skin_temp().await?;
     whoop.update_wear_periods().await?;
-    // Surplus-banking flag is persisted in config but not yet passed
-    // through — the `stage_sleep_with_opts` entry point lives on
-    // openwhoop master d44fe45 and isn't in the currently-pinned
-    // submodule. Bump vendor/openwhoop to pick it up, then switch
-    // this to `stage_sleep_with_opts(StageSleepOptions { ... })`.
-    whoop.stage_sleep().await?;
+    let stage_opts = {
+        let app_state = app.state::<AppState>();
+        let cfg = app_state.config.read().await;
+        openwhoop::sleep_staging::StageSleepOptions {
+            allow_surplus_banking: cfg.allow_surplus_banking,
+        }
+    };
+    whoop.stage_sleep_with_opts(stage_opts).await?;
     whoop.compute_daytime_hrv().await?;
     whoop.classify_activities().await?;
 
