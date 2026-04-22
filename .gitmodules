@@ -1,4 +1,4 @@
 [submodule "vendor/openwhoop"]
 	path = vendor/openwhoop
 	url = https://github.com/brennenawana/openwhoop.git
-	branch = integration/whoop-tray
+	branch = whoop-tray
