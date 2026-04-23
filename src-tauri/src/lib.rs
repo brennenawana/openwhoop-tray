@@ -18,7 +18,7 @@ use openwhoop_algos::{
 use openwhoop_codec::{
     WhoopData, WhoopPacket,
     constants::{
-        CMD_TO_STRAP_GEN4 as CMD_TO_STRAP, CommandNumber,
+        ALL_WHOOP_SERVICES, CMD_TO_STRAP_GEN4 as CMD_TO_STRAP, CommandNumber,
         DATA_FROM_STRAP_GEN4 as DATA_FROM_STRAP, PacketType,
         WHOOP_SERVICE_GEN4 as WHOOP_SERVICE, WhoopGeneration,
     },
@@ -133,6 +133,17 @@ enum CancelReason {
     User,
     HardTimeout,
     NoProgress,
+}
+
+/// Aborts a spawned tokio task when dropped. Used to guarantee auxiliary
+/// tasks (hard-timeout watchdog, progress poller) never outlive their parent,
+/// even on early-return / retry paths.
+struct AbortOnDrop<T>(tauri::async_runtime::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -432,7 +443,8 @@ async fn run_live_stream(app: AppHandle) -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
-    let peripheral = scan_for_device(&adapter, &device_name).await?;
+    // Live-stream uses Gen4-only characteristic helpers — ignore generation.
+    let (peripheral, _generation) = scan_for_device(&adapter, &device_name).await?;
     peripheral.connect().await?;
     let _ = adapter.stop_scan().await;
     peripheral.discover_services().await?;
@@ -819,8 +831,8 @@ async fn do_ring_strap(app: AppHandle) -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
-    let peripheral = scan_for_device(&adapter, &device_name).await?;
-    let mut device = WhoopDevice::new(peripheral, adapter, db, false, WhoopGeneration::Gen4);
+    let (peripheral, generation) = scan_for_device(&adapter, &device_name).await?;
+    let mut device = WhoopDevice::new(peripheral, adapter, db, false, generation);
     device.connect().await?;
     device.send_command(WhoopPacket::run_alarm()).await?;
 
@@ -868,14 +880,14 @@ async fn do_alarm_op(app: AppHandle, op: AlarmOp) -> anyhow::Result<AlarmStatus>
         .next()
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
-    let peripheral = scan_for_device(&adapter, &device_name).await?;
-    let mut device = WhoopDevice::new(peripheral, adapter, db, false, WhoopGeneration::Gen4);
+    let (peripheral, generation) = scan_for_device(&adapter, &device_name).await?;
+    let mut device = WhoopDevice::new(peripheral, adapter, db, false, generation);
     device.connect().await?;
 
     // Apply the change. set/clear don't return useful responses, so we
     // always follow with get_alarm to confirm.
     if let AlarmOp::Set(unix) = op {
-        device.send_command(WhoopPacket::alarm_time(unix, WhoopGeneration::Gen4)).await?;
+        device.send_command(WhoopPacket::alarm_time(unix, generation)).await?;
     }
     if matches!(op, AlarmOp::Clear) {
         device.send_command(WhoopPacket::disable_alarm()).await?;
@@ -1139,7 +1151,74 @@ async fn do_sync(app: AppHandle) -> anyhow::Result<SyncReport> {
         .map_err(|e| anyhow::anyhow!(e))?;
     let db: DatabaseHandler = (*db_arc).clone();
 
-    run_sync(&app, db, device_name).await
+    // Brief mid-sync BLE drops are the common failure mode (~30s out of range
+    // and back). The DB upserts by timestamp, so re-running run_sync over an
+    // overlapping window just refills the same rows — safe to retry.
+    const MAX_ATTEMPTS: u32 = 3;
+    let sync_cancel = state.sync_cancel.clone();
+    let sync_cancel_reason = state.sync_cancel_reason.clone();
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        // A user-initiated cancel should never be retried.
+        if sync_cancel.load(Ordering::SeqCst)
+            && matches!(
+                *sync_cancel_reason.read().await,
+                Some(CancelReason::User) | None
+            )
+        {
+            break;
+        }
+
+        match run_sync(&app, db.clone(), device_name.clone()).await {
+            Ok(report) => return Ok(report),
+            Err(e) => {
+                let retryable = is_retryable_sync_error(&e);
+                if !retryable || attempt == MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                let backoff = Duration::from_secs(5 * u64::from(attempt));
+                eprintln!(
+                    "openwhoop-tray: sync attempt {attempt}/{MAX_ATTEMPTS} failed ({e}); retrying in {}s",
+                    backoff.as_secs()
+                );
+                last_err = Some(e);
+
+                // Clear the cancel flag between attempts so the next run_sync
+                // starts with a clean slate. Safe because we just verified
+                // above that this isn't a user-initiated cancel.
+                sync_cancel.store(false, Ordering::SeqCst);
+                *sync_cancel_reason.write().await = None;
+
+                // Let the UI know we're waiting — the frontend shows a
+                // "reconnecting" stage label if present, otherwise just keeps
+                // syncing=true which the watchdog will eventually clear if
+                // every retry hangs (belt + suspenders).
+                emit_progress(&app, "reconnecting");
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("sync failed with no specific error")))
+}
+
+/// Errors that imply the strap is out of range or the link is flaky — worth
+/// retrying. Anything else (config missing, DB broken, user-cancelled) is not.
+/// We match on error messages because the library returns `anyhow::Error`; if
+/// we later introduce a typed error, replace this with a proper downcast.
+fn is_retryable_sync_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    const RETRYABLE_MARKERS: &[&str] = &[
+        "peripheral disconnected",
+        "is_connected check",
+        "notification stream ended",
+        "no gen4 history notifications",
+        "no incoming packets",
+        "idle timeout",
+        "not found within",
+    ];
+    RETRYABLE_MARKERS.iter().any(|m| msg.contains(m))
 }
 
 async fn run_sync(
@@ -1158,14 +1237,15 @@ async fn run_sync(
 
     // Hard timeout: a parallel task flips the cancel flag after SYNC_TIMEOUT.
     // sync_history checks the flag at the top of each iteration, so it will
-    // unwind cleanly. Aborted on success.
+    // unwind cleanly. AbortOnDrop guarantees the task is cancelled on every
+    // exit path (success, ?-propagated error, panic), not just happy path.
     let timeout_cancel = cancel.clone();
     let timeout_reason = cancel_reason.clone();
-    let timeout_task = tauri::async_runtime::spawn(async move {
+    let _timeout_task = AbortOnDrop(tauri::async_runtime::spawn(async move {
         tokio::time::sleep(SYNC_TIMEOUT).await;
         *timeout_reason.write().await = Some(CancelReason::HardTimeout);
         timeout_cancel.store(true, Ordering::SeqCst);
-    });
+    }));
 
     emit_progress(app, "scanning");
     let manager = Manager::new().await?;
@@ -1175,12 +1255,12 @@ async fn run_sync(
         .next()
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
-    let peripheral = scan_for_device(&adapter, &device_name).await?;
+    let (peripheral, generation) = scan_for_device(&adapter, &device_name).await?;
     // Strap responded to the scan — mark presence even if later steps fail.
     *app.state::<AppState>().strap_seen_at.write().await = Some(Local::now().naive_local());
 
     emit_progress(app, "connecting");
-    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false, WhoopGeneration::Gen4);
+    let mut device = WhoopDevice::new(peripheral, adapter, db.clone(), false, generation);
     device.connect().await?;
     device.initialize().await?;
 
@@ -1191,13 +1271,13 @@ async fn run_sync(
     // Doubles as a stall detector: if the count hasn't advanced for 30s after
     // we've already received at least one packet, fire the cancel flag with
     // a NoProgress reason so the user gets a friendly recovery message
-    // instead of waiting out the 5-minute hard timeout.
+    // instead of waiting out the 15-minute hard timeout.
     let progress_app = app.clone();
     let progress_db = db.clone();
     let progress_baseline = before;
     let progress_cancel = cancel.clone();
     let progress_reason = cancel_reason.clone();
-    let progress_task = tauri::async_runtime::spawn(async move {
+    let _progress_task = AbortOnDrop(tauri::async_runtime::spawn(async move {
         const STALL_THRESHOLD: Duration = Duration::from_secs(30);
         let mut last_count = progress_baseline;
         let mut last_progress_at = Instant::now();
@@ -1229,13 +1309,12 @@ async fn run_sync(
                 break;
             }
         }
-    });
+    }));
 
     let sync_result = device
         .sync_history(cancel.clone(), openwhoop::HistorySyncConfig::default())
         .await;
-    progress_task.abort();
-    timeout_task.abort();
+    // Tasks are aborted by AbortOnDrop on every return path below.
     sync_result?;
 
     if cancel.load(Ordering::SeqCst) {
@@ -1283,14 +1362,23 @@ async fn run_sync(
         }
     };
 
-    if device.is_connected().await.unwrap_or(false) {
-        let _ = device
-            .send_command(WhoopPacket::exit_high_freq_sync())
-            .await;
+    // Bound this BLE round-trip so btleplug can't hang the whole sync if
+    // the strap has drifted since sync_history returned.
+    let connected = tokio::time::timeout(Duration::from_secs(2), device.is_connected())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(false);
+    if connected {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            device.send_command(WhoopPacket::exit_high_freq_sync()),
+        )
+        .await;
     }
 
     emit_progress(app, "processing");
-    let whoop = OpenWhoop::new(db.clone(), WhoopGeneration::Gen4);
+    let whoop = OpenWhoop::new(db.clone(), generation);
     whoop.detect_sleeps().await?;
     whoop.detect_events().await?;
     whoop.calculate_stress().await?;
@@ -1335,10 +1423,10 @@ fn emit_progress(app: &AppHandle, stage: &str) {
 async fn scan_for_device(
     adapter: &Adapter,
     name_prefix: &str,
-) -> anyhow::Result<Peripheral> {
+) -> anyhow::Result<(Peripheral, WhoopGeneration)> {
     adapter
         .start_scan(ScanFilter {
-            services: vec![WHOOP_SERVICE],
+            services: ALL_WHOOP_SERVICES.to_vec(),
         })
         .await?;
 
@@ -1353,14 +1441,20 @@ async fn scan_for_device(
             let Ok(Some(properties)) = peripheral.properties().await else {
                 continue;
             };
-            if !properties.services.contains(&WHOOP_SERVICE) {
+            let Some(generation) = ALL_WHOOP_SERVICES.iter().find_map(|svc| {
+                properties
+                    .services
+                    .contains(svc)
+                    .then(|| WhoopGeneration::from_service(*svc))
+                    .flatten()
+            }) else {
                 continue;
-            }
+            };
             let Some(local_name) = properties.local_name else {
                 continue;
             };
             if sanitize_name(&local_name).starts_with(name_prefix) {
-                return Ok(peripheral);
+                return Ok((peripheral, generation));
             }
         }
 
