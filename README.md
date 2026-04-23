@@ -30,6 +30,20 @@ A macOS menu bar companion for your WHOOP strap. Syncs data over Bluetooth, proc
 
 Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com/bWanShiTong/openwhoop) Rust library by [@bWanShiTong](https://github.com/bWanShiTong).
 
+## Screenshots
+
+![Now dashboard](docs/screenshots/now.png)
+
+| History | Customize layout | Settings |
+|---|---|---|
+| ![History](docs/screenshots/history.png) | ![Customize layout](docs/screenshots/customize-layout.png) | ![Settings](docs/screenshots/settings.png) |
+
+### Themes
+
+| Light | Slate | Midnight | Monokai |
+|---|---|---|---|
+| ![Light](docs/screenshots/light-theme.png) | ![Slate](docs/screenshots/slate-theme.png) | ![Midnight](docs/screenshots/midnight-theme.png) | ![Monokai](docs/screenshots/monokai-theme.png) |
+
 ## Features
 
 - **Menu bar app** — lives in the tray, no dock icon. Left-click shows battery / presence / last sync at a glance.
