@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import {
+  HypnogramModal,
+  SkylineHypnogram,
+  STAGE_COLOR,
+} from "./Hypnogram";
 import type {
   ActivityBreakdown,
   AlarmStatus,
@@ -20,7 +25,35 @@ import type {
 import "./App.css";
 import { HistoryView } from "./HistoryView";
 
-type View = "now" | "dash" | "history";
+type View = "now" | "history";
+
+/** Display mode toggles between the compact tray window and a wider
+ *  multi-column layout. Independent of view: both Now and History
+ *  render in either mode, and the selection is persisted. */
+type Mode = "compact" | "expanded";
+
+const MODE_WINDOW_SIZE: Record<Mode, { w: number; h: number }> = {
+  compact: { w: 420, h: 620 },
+  expanded: { w: 1100, h: 720 },
+};
+
+/** Section IDs used by the Now-page show/hide customization. Order
+ *  here is the canonical render order; users can hide any of them but
+ *  the layout itself is fixed (no reorder). */
+type SectionId =
+  | "recovery"
+  | "today"
+  | "latest_sleep"
+  | "week"
+  | "activity";
+
+const SECTION_LABELS: Record<SectionId, string> = {
+  recovery: "Recovery",
+  today: "Today",
+  latest_sleep: "Latest sleep",
+  week: "Last 7 days",
+  activity: "Today's activity",
+};
 
 type Theme = "monokai" | "midnight" | "slate" | "light";
 
@@ -30,107 +63,6 @@ const THEME_OPTIONS: { value: Theme; label: string; hint: string }[] = [
   { value: "slate", label: "Slate", hint: "Cool grey" },
   { value: "light", label: "Light", hint: "Off-white" },
 ];
-
-// Window dims per view. "dash" is a wide, horizontal dashboard that fits the
-// four Now sections in a 2-column grid without scrolling.
-const VIEW_WINDOW_SIZE: Record<View, { w: number; h: number }> = {
-  now: { w: 420, h: 620 },
-  dash: { w: 1100, h: 720 },
-  history: { w: 420, h: 620 },
-};
-
-// Theme-aware stage colors. Resolved from CSS variables defined in
-// App.css so light mode can darken them for contrast on near-white
-// backgrounds without branching per-theme in component code.
-const STAGE_COLOR: Record<SleepStage, string> = {
-  Wake: "var(--stage-wake)",
-  Light: "var(--stage-light)",
-  REM: "var(--stage-rem)",
-  Deep: "var(--stage-deep)",
-  Unknown: "var(--stage-unknown)",
-};
-
-// Fractional bar height per stage for the "sleep journey" visualization.
-// Flatter than the history-page thumbs: the thumbs trade accuracy for
-// visual pop at small sizes, but at full card width a gentler amplitude
-// reads more like a rolling wave and less like a spiky mountain range.
-const STAGE_DEPTH: Record<SleepStage, number> = {
-  Wake: 0.22,
-  Light: 0.52,
-  REM: 0.72,
-  Deep: 1.0,
-  Unknown: 0.1,
-};
-
-// Smooth a raw hypnogram by bucketing it into fixed-duration windows
-// (default 5 min) and picking each bucket's *dominant* stage (majority
-// time). Adjacent same-stage buckets are then merged back together so
-// the downstream renderer sees long spans rather than repeated tiles.
-//
-// Rationale: hypnograms are scored per 30-sec epoch, so a ~1-min
-// "wake" surrounded by light sleep is almost always noise — sensor
-// blip, a roll-over, a momentary HR spike. AASM scoring rules already
-// require multiple consecutive epochs to count as a stage change;
-// this does the same at UI time so the chart stops rendering those
-// micro-events as meaningful structure.
-function smoothHypnogram(
-  hypnogram: HypnogramEntry[],
-  bucketMinutes = 5,
-): HypnogramEntry[] {
-  if (hypnogram.length === 0) return hypnogram;
-  const t0 = new Date(hypnogram[0].start).getTime();
-  const t1 = new Date(hypnogram[hypnogram.length - 1].end).getTime();
-  if (t1 <= t0) return hypnogram;
-
-  const bucketMs = bucketMinutes * 60_000;
-  const numBuckets = Math.max(1, Math.ceil((t1 - t0) / bucketMs));
-  const out: HypnogramEntry[] = [];
-
-  for (let i = 0; i < numBuckets; i += 1) {
-    const bStart = t0 + i * bucketMs;
-    const bEnd = Math.min(t0 + (i + 1) * bucketMs, t1);
-    const tallies: Partial<Record<SleepStage, number>> = {};
-    for (const seg of hypnogram) {
-      const sStart = new Date(seg.start).getTime();
-      const sEnd = new Date(seg.end).getTime();
-      const oStart = Math.max(bStart, sStart);
-      const oEnd = Math.min(bEnd, sEnd);
-      if (oEnd > oStart) {
-        tallies[seg.stage] = (tallies[seg.stage] ?? 0) + (oEnd - oStart);
-      }
-    }
-    let dominant: SleepStage = "Unknown";
-    let maxDur = 0;
-    for (const [stage, dur] of Object.entries(tallies) as [
-      SleepStage,
-      number,
-    ][]) {
-      if (dur > maxDur) {
-        maxDur = dur;
-        dominant = stage;
-      }
-    }
-    if (maxDur === 0) continue;
-    out.push({
-      start: new Date(bStart).toISOString(),
-      end: new Date(bEnd).toISOString(),
-      stage: dominant,
-    });
-  }
-
-  // Merge consecutive same-stage buckets so the SVG renderer draws one
-  // long rectangle per run instead of a row of tiles.
-  const merged: HypnogramEntry[] = [];
-  for (const b of out) {
-    const last = merged[merged.length - 1];
-    if (last && last.stage === b.stage) {
-      last.end = b.end;
-    } else {
-      merged.push({ ...b });
-    }
-  }
-  return merged;
-}
 
 // Sleep-journey hypnogram.
 //
@@ -214,176 +146,27 @@ function SleepStoryLine({ snapshot }: { snapshot: SleepSnapshot }) {
 function HypnogramStrip({
   hypnogram,
   cycleCount,
+  onClick,
 }: {
   hypnogram: HypnogramEntry[];
   cycleCount?: number | null;
+  onClick?: () => void;
 }) {
-  if (hypnogram.length === 0) {
-    return (
-      <div className="h-28 rounded bg-zinc-950/60 grid place-items-center text-[10px] text-zinc-600">
-        no hypnogram
-      </div>
-    );
-  }
-
-  // Collapse sub-5-min noise into the surrounding stage so the skyline
-  // tracks the night's real architecture instead of sensor jitter.
-  const smoothed = smoothHypnogram(hypnogram, 5);
-
-  const VB_W = 400;
-  const VB_H = 120;
-  const padL = 30;
-  const padR = 6;
-  const padT = 10;
-  const padB = 16;
-  const chartW = VB_W - padL - padR;
-  const chartH = VB_H - padT - padB;
-
-  const t0 = new Date(smoothed[0].start).getTime();
-  const t1 = new Date(smoothed[smoothed.length - 1].end).getTime();
-  const tSpan = Math.max(1, t1 - t0);
-
-  const xFor = (time: number) => padL + ((time - t0) / tSpan) * chartW;
-  const yForDepth = (depth: number) =>
-    VB_H - padB - chartH * depth;
-
-  // Y-axis labels at each stage's true skyline altitude. Tells the
-  // reader "bars reaching this height = this stage."
-  const stageLabels: { stage: SleepStage; label: string }[] = [
-    { stage: "Deep", label: "Deep" },
-    { stage: "REM", label: "REM" },
-    { stage: "Light", label: "Light" },
-    { stage: "Wake", label: "Wake" },
-  ];
-
-  // Hour ticks across the night.
-  const startDate = new Date(t0);
-  const firstHour = new Date(startDate);
-  firstHour.setMinutes(0, 0, 0);
-  if (firstHour.getTime() < t0) firstHour.setHours(firstHour.getHours() + 1);
-  const hourTicks: number[] = [];
-  for (let h = firstHour.getTime(); h <= t1; h += 3600_000) {
-    hourTicks.push(h);
-  }
-
-  // Cycle dividers: evenly split the night based on the detected count.
-  // Not exact per-cycle boundaries (that requires REM-based detection),
-  // but a useful rhythm cue that matches whoop/oura conventions.
-  const cycleDividers: number[] = [];
-  if (cycleCount && cycleCount > 1) {
-    for (let i = 1; i < cycleCount; i += 1) {
-      cycleDividers.push(t0 + (tSpan * i) / cycleCount);
-    }
-  }
-
   return (
-    <svg
-      viewBox={`0 0 ${VB_W} ${VB_H}`}
-      preserveAspectRatio="none"
-      className="w-full h-28 rounded bg-zinc-950/60"
-    >
-      {/* Y-axis labels at each stage's fill height */}
-      {stageLabels.map(({ stage, label }) => (
-        <g key={stage}>
-          <line
-            x1={padL}
-            y1={yForDepth(STAGE_DEPTH[stage])}
-            x2={VB_W - padR}
-            y2={yForDepth(STAGE_DEPTH[stage])}
-            stroke="var(--color-zinc-800)"
-            strokeWidth={0.4}
-            strokeDasharray="2,4"
-            vectorEffect="non-scaling-stroke"
-          />
-          <text
-            x={padL - 4}
-            y={yForDepth(STAGE_DEPTH[stage]) + 2.5}
-            fontSize={7}
-            fill="var(--color-zinc-500)"
-            textAnchor="end"
-            style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
-          >
-            {label}
-          </text>
-        </g>
-      ))}
-
-      {/* Hourly vertical gridlines */}
-      {hourTicks.map((t) => (
-        <g key={`h${t}`}>
-          <line
-            x1={xFor(t)}
-            y1={padT}
-            x2={xFor(t)}
-            y2={VB_H - padB}
-            stroke="var(--color-zinc-800)"
-            strokeWidth={0.3}
-            vectorEffect="non-scaling-stroke"
-          />
-          <text
-            x={xFor(t)}
-            y={VB_H - padB + 8}
-            fontSize={6.5}
-            fill="var(--color-zinc-600)"
-            textAnchor="middle"
-            style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
-          >
-            {new Date(t).getHours().toString().padStart(2, "0")}
-          </text>
-        </g>
-      ))}
-
-      {/* Cycle dividers */}
-      {cycleDividers.map((t, i) => (
-        <line
-          key={`c${i}`}
-          x1={xFor(t)}
-          y1={padT}
-          x2={xFor(t)}
-          y2={VB_H - padB}
-          stroke="var(--color-zinc-700)"
-          strokeWidth={0.6}
-          strokeDasharray="1,3"
-          vectorEffect="non-scaling-stroke"
-        />
-      ))}
-
-      {/* Stage skyline — filled bars per smoothed segment */}
-      {smoothed.map((h, i) => {
-        const depth = STAGE_DEPTH[h.stage] ?? STAGE_DEPTH.Unknown;
-        if (depth <= 0) return null;
-        const x0 = xFor(new Date(h.start).getTime());
-        const x1v = xFor(new Date(h.end).getTime());
-        const yTop = yForDepth(depth);
-        const height = VB_H - padB - yTop;
-        return (
-          <rect
-            key={i}
-            x={x0}
-            y={yTop}
-            width={Math.max(0.5, x1v - x0)}
-            height={Math.max(0, height)}
-            fill={STAGE_COLOR[h.stage] ?? STAGE_COLOR.Unknown}
-            opacity={0.9}
-          >
-            <title>
-              {h.stage} · {formatTime(h.start)}–{formatTime(h.end)}
-            </title>
-          </rect>
-        );
-      })}
-
-      {/* Baseline (visual anchor for bottom of bars) */}
-      <line
-        x1={padL}
-        y1={VB_H - padB}
-        x2={VB_W - padR}
-        y2={VB_H - padB}
-        stroke="var(--color-zinc-700)"
-        strokeWidth={0.6}
-        vectorEffect="non-scaling-stroke"
-      />
-    </svg>
+    <SkylineHypnogram
+      hypnogram={hypnogram}
+      heightClass="h-28"
+      vbWidth={400}
+      vbHeight={120}
+      padding={{ l: 30, r: 6, t: 10, b: 16 }}
+      cycleCount={cycleCount ?? null}
+      showStageLabels
+      showHourTicks
+      showCycleDividers
+      showBaseline
+      onClick={onClick}
+      ariaLabel="Open hypnogram in close-up view"
+    />
   );
 }
 
@@ -1206,7 +989,7 @@ function RingGauge({
   band: "red" | "yellow" | "green";
   palette: RingKey;
   size?: number;
-  subLabel?: string;
+  subLabel?: React.ReactNode;
   title?: string;
 }) {
   const stroke = 8;
@@ -1262,7 +1045,7 @@ function RingGauge({
           </span>
         </div>
       </div>
-      <div className="flex items-center gap-1.5 min-h-[14px]">
+      <div className="flex items-center justify-center gap-1.5 min-h-[14px]">
         {score != null && (
           <span
             className="inline-block h-1.5 w-1.5 rounded-full"
@@ -1270,11 +1053,14 @@ function RingGauge({
             aria-label={`${band} band`}
           />
         )}
-        {subLabel && (
-          <span className="text-[10px] text-zinc-500 tabular-nums">
-            {subLabel}
-          </span>
-        )}
+        {subLabel &&
+          (typeof subLabel === "string" ? (
+            <span className="text-[10px] text-zinc-500 tabular-nums">
+              {subLabel}
+            </span>
+          ) : (
+            subLabel
+          ))}
       </div>
     </div>
   );
@@ -1321,108 +1107,154 @@ function RecoveryCard({
   const sleepBand =
     sleepPerformance != null ? bandFromScore(sleepPerformance) : ("yellow" as const);
 
+  // Recovery ring's caption: amber Calibrating pill while still building
+  // baseline history, otherwise a quiet "vs N-night baseline" footnote.
+  // Lives inside the ring's tile (rather than as an orphaned flex row
+  // below the row of rings) so the pairing reads visually.
+  const recoveryCaption = r.calibrating ? (
+    <span
+      className="rounded-full bg-amber-500/20 border border-amber-500/30 px-1.5 py-[1px] text-[9px] uppercase text-amber-300 whitespace-nowrap tabular-nums"
+      title={`Calibrating: baseline uses ${r.baseline_window_nights} of 14 nights. Accuracy improves as more data accumulates.`}
+    >
+      {r.baseline_window_nights}/14 nights
+    </span>
+  ) : (
+    <span className="text-[10px] text-zinc-500 tabular-nums whitespace-nowrap">
+      vs {r.baseline_window_nights}-night baseline
+    </span>
+  );
+
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-around gap-2">
-        <RingGauge
-          label="Recovery"
-          score={r.score}
-          band={r.band}
-          palette="recovery"
-          size={96}
-          title="Composite readiness: HRV + RHR + sleep + respiratory rate + skin temp, weighted against your personal baseline."
-        />
-        <RingGauge
-          label="Sleep"
-          score={sleepPerformance}
-          band={sleepBand}
-          palette="sleep"
-          size={96}
-          title="Sleep performance — sufficiency + efficiency + restorative stages + consistency + stress."
-        />
-        <RingGauge
-          label="HRV"
-          score={hrvScore}
-          band={hrvBand}
-          palette="hrv"
-          size={96}
-          subLabel={hrvSubLabel}
-          title={hrvTitle}
-        />
+      <p className="text-[11px] text-zinc-400">
+        {r.dominant_driver === "none"
+          ? "All metrics near personal baseline."
+          : `Main driver: ${driverLabel[r.dominant_driver]}.`}
+      </p>
+
+      <div className="grid grid-cols-3 gap-2">
+        <RingTile>
+          <RingGauge
+            label="Recovery"
+            score={r.score}
+            band={r.band}
+            palette="recovery"
+            size={96}
+            subLabel={recoveryCaption}
+            title="Composite readiness: HRV + RHR + sleep + respiratory rate + skin temp, weighted against your personal baseline."
+          />
+        </RingTile>
+        <RingTile>
+          <RingGauge
+            label="Sleep"
+            score={sleepPerformance}
+            band={sleepBand}
+            palette="sleep"
+            size={96}
+            subLabel={
+              sleepPerformance != null ? (
+                <span className="text-[10px] text-zinc-500">last night</span>
+              ) : undefined
+            }
+            title="Sleep performance — sufficiency + efficiency + restorative stages + consistency + stress."
+          />
+        </RingTile>
+        <RingTile>
+          <RingGauge
+            label="HRV"
+            score={hrvScore}
+            band={hrvBand}
+            palette="hrv"
+            size={96}
+            subLabel={hrvSubLabel}
+            title={hrvTitle}
+          />
+        </RingTile>
+      </div>
+
+      <BaselineDeltaList r={r} />
+    </div>
+  );
+}
+
+/** Bordered ring "card". The light border around each ring + caption
+ *  visually pairs them so the caption is unambiguously about that ring. */
+function RingTile({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl border border-zinc-800/70 bg-zinc-950/30 p-2.5 flex justify-center">
+      {children}
+    </div>
+  );
+}
+
+/** Per-metric "today vs your baseline" rows. Each row has the metric
+ *  name, a centered-zero deviation bar (-2σ to +2σ), and the σ value
+ *  color-coded to "better" (positive) vs "worse" (negative). The visual
+ *  bar lets you compare metrics at a glance without parsing numbers. */
+function BaselineDeltaList({ r }: { r: RecoverySection }) {
+  const candidates: { label: string; z: number | null }[] = [
+    { label: "HRV", z: r.z_hrv },
+    { label: "Resting HR", z: r.z_rhr },
+    { label: "Sleep", z: r.z_sleep },
+    { label: "Respiratory", z: r.z_rr },
+    { label: "Skin temp", z: r.z_skin_temp },
+  ];
+  const rows = candidates.filter(
+    (m): m is { label: string; z: number } => m.z != null,
+  );
+
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-baseline justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+          Today vs your baseline
+        </span>
+        <span
+          className="text-[9px] text-zinc-600"
+          title="Standard deviations from your rolling personal baseline. Positive = better than usual."
+        >
+          σ = std-dev from baseline
+        </span>
       </div>
       <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2 flex-wrap text-[11px] text-zinc-400">
-          <span>
-            {r.dominant_driver === "none"
-              ? "All metrics near personal baseline."
-              : `Main driver: ${driverLabel[r.dominant_driver]}.`}
-          </span>
-          {r.calibrating && (
-            <span
-              className="rounded-full bg-amber-500/20 border border-amber-500/30 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-amber-300"
-              title={`Baseline uses ${r.baseline_window_nights} of 14 nights. Accuracy improves as more data accumulates.`}
-            >
-              Calibrating
-            </span>
-          )}
-          <span className="text-[10px] text-zinc-600 ml-auto">
-            vs {r.baseline_window_nights}-night baseline
-          </span>
-        </div>
+        {rows.map((row) => (
+          <BaselineDeltaRow key={row.label} label={row.label} z={row.z} />
+        ))}
       </div>
-      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-zinc-500 tabular-nums">
-        {r.z_hrv != null && (
-          <span title="HRV z-score vs baseline (positive = better)">
-            HRV{" "}
-            <span className={r.z_hrv >= 0 ? "text-emerald-300" : "text-rose-300"}>
-              {r.z_hrv >= 0 ? "+" : ""}
-              {r.z_hrv.toFixed(2)}σ
-            </span>
-          </span>
-        )}
-        {r.z_rhr != null && (
-          <span title="RHR z-score (positive = lower-than-baseline = better)">
-            RHR{" "}
-            <span className={r.z_rhr >= 0 ? "text-emerald-300" : "text-rose-300"}>
-              {r.z_rhr >= 0 ? "+" : ""}
-              {r.z_rhr.toFixed(2)}σ
-            </span>
-          </span>
-        )}
-        {r.z_sleep != null && (
-          <span title="Sleep performance z-score">
-            Sleep{" "}
-            <span
-              className={r.z_sleep >= 0 ? "text-emerald-300" : "text-rose-300"}
-            >
-              {r.z_sleep >= 0 ? "+" : ""}
-              {r.z_sleep.toFixed(2)}σ
-            </span>
-          </span>
-        )}
-        {r.z_rr != null && (
-          <span title="Respiratory rate z-score (positive = lower-than-baseline = better)">
-            RR{" "}
-            <span className={r.z_rr >= 0 ? "text-emerald-300" : "text-rose-300"}>
-              {r.z_rr >= 0 ? "+" : ""}
-              {r.z_rr.toFixed(2)}σ
-            </span>
-          </span>
-        )}
-        {r.z_skin_temp != null && (
-          <span title="Skin temp z-score (positive = closer-to-baseline = better)">
-            Skin{" "}
-            <span
-              className={
-                r.z_skin_temp >= 0 ? "text-emerald-300" : "text-rose-300"
-              }
-            >
-              {r.z_skin_temp >= 0 ? "+" : ""}
-              {r.z_skin_temp.toFixed(2)}σ
-            </span>
-          </span>
-        )}
+    </div>
+  );
+}
+
+function BaselineDeltaRow({ label, z }: { label: string; z: number }) {
+  // Bar maps the z-score onto a -2σ → +2σ axis with the baseline at the
+  // center. Past ±2σ values clamp to the bar edges so an outlier doesn't
+  // distort the relative reading of other rows.
+  const max = 2;
+  const clamped = Math.max(-max, Math.min(max, z));
+  const positive = z >= 0;
+  // Convert clamped z into a fill from the center tick to the marker.
+  const centerPct = 50;
+  const offsetPct = (Math.abs(clamped) / max) * 50;
+  const leftPct = positive ? centerPct : centerPct - offsetPct;
+  const widthPct = offsetPct;
+  const fillCls = positive ? "bg-emerald-500/60" : "bg-rose-500/60";
+  const valueCls = positive ? "text-emerald-300" : "text-rose-300";
+  return (
+    <div className="grid grid-cols-[5.5rem_1fr_3rem] items-center gap-2 text-[11px]">
+      <span className="text-zinc-400 truncate">{label}</span>
+      <div className="relative h-1.5 rounded-full bg-zinc-900">
+        <div className="absolute left-1/2 top-0 bottom-0 w-px bg-zinc-700" />
+        <div
+          className={`absolute top-0 bottom-0 rounded-full ${fillCls}`}
+          style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+        />
       </div>
+      <span className={`text-right tabular-nums ${valueCls}`}>
+        {positive ? "+" : ""}
+        {z.toFixed(2)}σ
+      </span>
     </div>
   );
 }
@@ -1430,12 +1262,38 @@ function RecoveryCard({
 function Section({
   title,
   children,
+  className = "",
+  editMode = false,
+  onHide,
 }: {
   title: string;
   children: React.ReactNode;
+  className?: string;
+  /** When true, render the iOS-style minus badge in the top-left and a
+   *  subtle ring around the section so it reads as "in edit mode." */
+  editMode?: boolean;
+  onHide?: () => void;
 }) {
   return (
-    <section className="flex flex-col gap-3">
+    <section
+      className={
+        "relative flex flex-col gap-3 " +
+        (editMode
+          ? "rounded-md ring-1 ring-zinc-700/60 bg-zinc-900/20 p-3 -m-1 "
+          : "") +
+        className
+      }
+    >
+      {editMode && onHide && (
+        <button
+          onClick={onHide}
+          className="absolute -top-2 -left-2 z-10 w-5 h-5 rounded-full bg-rose-500 text-white text-xs font-bold shadow-md flex items-center justify-center leading-none hover:bg-rose-600 transition-colors"
+          aria-label={`Hide ${title} widget`}
+          title={`Hide ${title}`}
+        >
+          −
+        </button>
+      )}
       <h2 className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">
         {title}
       </h2>
@@ -1553,6 +1411,11 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncStage, setSyncStage] = useState<SyncStage | null>(null);
+  // Timestamp of the most recent sync-related event from the backend. The
+  // watchdog effect below uses this to auto-recover the UI if the backend
+  // ever stops emitting events while `syncing` is true (last-resort defense
+  // against hangs that bypass the 15-minute hard timeout).
+  const syncActivityAtRef = useRef<number>(Date.now());
   const [lastSync, setLastSync] = useState<SyncReport | null>(null);
   const [tempUnit, setTempUnit] = useState<TempUnit>(() => {
     return (localStorage.getItem("tempUnit") as TempUnit) || "C";
@@ -1563,6 +1426,27 @@ function App() {
       ? saved
       : "monokai";
   });
+  const [debugMode, setDebugMode] = useState<boolean>(() => {
+    return localStorage.getItem("debugMode") === "true";
+  });
+  const [hiddenSections, setHiddenSections] = useState<SectionId[]>(() => {
+    try {
+      const raw = localStorage.getItem("hiddenSections");
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr)
+        ? arr.filter((s): s is SectionId => s in SECTION_LABELS)
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const [editMode, setEditMode] = useState(false);
+  const isSectionHidden = (id: SectionId) => hiddenSections.includes(id);
+  const hideSection = (id: SectionId) =>
+    setHiddenSections((prev) => (prev.includes(id) ? prev : [...prev, id]));
+  const showSection = (id: SectionId) =>
+    setHiddenSections((prev) => prev.filter((s) => s !== id));
   const [deviceName, setDeviceName] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [syncInterval, setSyncInterval] = useState<number>(0);
@@ -1578,6 +1462,16 @@ function App() {
   const [alarmInputTouched, setAlarmInputTouched] = useState<boolean>(false);
   const [tick, setTick] = useState(0);
   const [view, setView] = useState<View>("now");
+  const [mode, setMode] = useState<Mode>(() => {
+    const saved = localStorage.getItem("displayMode") as Mode | null;
+    return saved === "expanded" || saved === "compact" ? saved : "compact";
+  });
+  const [zoomedHypnogram, setZoomedHypnogram] = useState<{
+    title: string;
+    subtitle?: string;
+    hypnogram: HypnogramEntry[];
+    cycleCount: number | null;
+  } | null>(null);
   const [liveActive, setLiveActive] = useState(false);
   const [liveStarting, setLiveStarting] = useState(false);
   const [liveBpm, setLiveBpm] = useState<number | null>(null);
@@ -1589,21 +1483,31 @@ function App() {
   }, []);
   void tick;
 
-  // Resize the window to match the active view. Dashboard is wide so its
-  // 2-col grid fits without scrolling; tray/history return to compact.
+  // Resize the window to match the display mode. Compact = tray-sized;
+  // expanded = wide multi-column dashboard. Independent of which view
+  // (Now / History) is active, so toggling mode keeps you in place.
   useEffect(() => {
-    const { w, h } = VIEW_WINDOW_SIZE[view];
+    const { w, h } = MODE_WINDOW_SIZE[mode];
     getCurrentWindow()
       .setSize(new LogicalSize(w, h))
       .catch(() => {
         // non-fatal: capability may not be granted in some builds
       });
-  }, [view]);
+    localStorage.setItem("displayMode", mode);
+  }, [mode]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem("debugMode", debugMode ? "true" : "false");
+  }, [debugMode]);
+
+  useEffect(() => {
+    localStorage.setItem("hiddenSections", JSON.stringify(hiddenSections));
+  }, [hiddenSections]);
 
   useEffect(() => {
     if (!showSettings) return;
@@ -1755,6 +1659,7 @@ function App() {
     (async () => {
       unlistenFns.push(
         await listen<SyncStage>("sync:progress", (e) => {
+          syncActivityAtRef.current = Date.now();
           setSyncStage(e.payload);
           setSyncing(e.payload !== "done");
           if (e.payload === "scanning") {
@@ -1764,11 +1669,13 @@ function App() {
       );
       unlistenFns.push(
         await listen<number>("sync:download_progress", (e) => {
+          syncActivityAtRef.current = Date.now();
           setDownloadCount(e.payload);
         })
       );
       unlistenFns.push(
         await listen<SyncReport>("sync:complete", (e) => {
+          syncActivityAtRef.current = Date.now();
           setLastSync(e.payload);
           setSyncing(false);
           setSyncStage(null);
@@ -1778,6 +1685,7 @@ function App() {
       );
       unlistenFns.push(
         await listen<string>("sync:error", (e) => {
+          syncActivityAtRef.current = Date.now();
           setError(e.payload);
           setSyncing(false);
           setSyncStage(null);
@@ -1825,6 +1733,32 @@ function App() {
     })();
     return () => unlistenFns.forEach((fn) => fn());
   }, [refresh]);
+
+  // Last-resort watchdog: if `syncing` is true but no sync event has arrived
+  // for WATCHDOG_MS, assume the backend hung and reset the UI. The backend's
+  // 15-minute hard timeout and per-attempt retry logic should make this
+  // unreachable in normal operation — this exists so a regression there can't
+  // leave the app permanently stuck on "Downloading…".
+  useEffect(() => {
+    if (!syncing) return;
+    const WATCHDOG_MS = 20 * 60 * 1000;
+    const CHECK_INTERVAL_MS = 30_000;
+    syncActivityAtRef.current = Date.now();
+    const check = setInterval(() => {
+      if (Date.now() - syncActivityAtRef.current > WATCHDOG_MS) {
+        console.warn(
+          "openwhoop: sync watchdog fired — no events for 20 minutes, resetting UI"
+        );
+        setSyncing(false);
+        setSyncStage(null);
+        setDownloadCount(0);
+        setError(
+          "Sync stopped responding. Try again — if it persists, restart the app."
+        );
+      }
+    }, CHECK_INTERVAL_MS);
+    return () => clearInterval(check);
+  }, [syncing]);
 
   const onCancelSync = async () => {
     try {
@@ -1974,9 +1908,9 @@ function App() {
       style={{ scrollbarGutter: "stable" }}
     >
       <header className="flex items-center justify-between">
-        <div>
-          <h1 className="text-lg font-semibold tracking-tight flex items-center gap-1.5 flex-wrap">
-            OpenWhoop
+        <div className="min-w-0">
+          <h1 className="text-lg font-semibold tracking-tight">OpenWhoop</h1>
+          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 mt-1">
             {snapshot?.battery && (
               <>
                 <BatteryPill
@@ -1987,8 +1921,14 @@ function App() {
                 <WristPill isWorn={snapshot.battery.is_worn} />
               </>
             )}
-            <PresencePill seenAt={snapshot?.strap_seen_at ?? null} />
-          </h1>
+            {/* If the strap is on-wrist, presence is implied (it's with
+                you, so it's in range). Only surface the Presence pill
+                when we don't already know it's being worn — i.e. wear
+                status is unknown or the strap is off-wrist. */}
+            {snapshot?.battery?.is_worn !== true && (
+              <PresencePill seenAt={snapshot?.strap_seen_at ?? null} />
+            )}
+          </div>
           <p className="text-xs text-zinc-500">
             {syncing && syncStage === "downloading" && downloadCount > 0
               ? `Downloading… ${downloadCount.toLocaleString()} new readings`
@@ -2036,6 +1976,20 @@ function App() {
         </div>
         <div className="flex items-center gap-2">
           <button
+            onClick={() =>
+              setMode((m) => (m === "compact" ? "expanded" : "compact"))
+            }
+            className="rounded-md border border-zinc-800 hover:border-zinc-700 px-2 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
+            title={
+              mode === "compact"
+                ? "Expand window into multi-column dashboard"
+                : "Collapse to compact tray window"
+            }
+            aria-label={mode === "compact" ? "Expand view" : "Collapse view"}
+          >
+            {mode === "compact" ? "⤢" : "⤡"}
+          </button>
+          <button
             onClick={() => setShowSettings((v) => !v)}
             className="rounded-md border border-zinc-800 hover:border-zinc-700 px-2 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
             title="Settings"
@@ -2061,10 +2015,13 @@ function App() {
       </header>
 
       <nav className="flex items-center gap-1 -mt-2 text-[11px]">
-        {(["now", "dash", "history"] as const).map((v) => (
+        {(["now", "history"] as const).map((v) => (
           <button
             key={v}
-            onClick={() => setView(v)}
+            onClick={() => {
+              setView(v);
+              if (v !== "now") setEditMode(false);
+            }}
             className={
               "rounded-full px-3 py-1 uppercase tracking-wider transition-colors " +
               (view === v
@@ -2072,9 +2029,27 @@ function App() {
                 : "text-zinc-500 hover:text-zinc-300")
             }
           >
-            {v === "now" ? "Now" : v === "dash" ? "Dashboard" : "History"}
+            {v === "now" ? "Now" : "History"}
           </button>
         ))}
+        {view === "now" && (
+          <button
+            onClick={() => setEditMode((v) => !v)}
+            className={
+              "ml-auto rounded-full px-3 py-1 uppercase tracking-wider transition-colors " +
+              (editMode
+                ? "bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                : "text-zinc-500 hover:text-zinc-300 border border-transparent")
+            }
+            title={
+              editMode
+                ? "Done customizing widgets"
+                : "Show or hide Now-page widgets"
+            }
+          >
+            {editMode ? "Done" : "Customize"}
+          </button>
+        )}
       </nav>
 
       {showSettings && (
@@ -2253,6 +2228,24 @@ function App() {
             />
           </label>
 
+          <label className="flex items-start justify-between cursor-pointer gap-3">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+                Developer debugger
+              </span>
+              <span className="text-[10px] text-zinc-600 leading-snug">
+                Shows the raw "Recent events" stream and other internal
+                instrumentation. Off by default.
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={debugMode}
+              onChange={(e) => setDebugMode(e.target.checked)}
+              className="accent-rose-500 mt-0.5"
+            />
+          </label>
+
           <div className="flex flex-col gap-2 border-t border-zinc-800 pt-3">
             <div className="flex items-center justify-between">
               <label className="text-[10px] uppercase tracking-wider text-zinc-500">
@@ -2372,17 +2365,25 @@ function App() {
           );
         })()}
 
-      {view === "history" && <HistoryView visible={view === "history"} />}
+      {view === "history" && (
+        <HistoryView visible={view === "history"} mode={mode} />
+      )}
 
-      {(view === "now" || view === "dash") && (
+      {view === "now" && (
       <div
         className={
-          view === "dash"
+          mode === "expanded"
             ? "grid grid-cols-2 gap-x-8 gap-y-6 auto-rows-min"
             : "flex flex-col gap-6"
         }
       >
-      <Section title="Recovery">
+      {!isSectionHidden("recovery") && (
+      <Section
+        title="Recovery"
+        className={mode === "expanded" ? "col-span-2" : ""}
+        editMode={editMode}
+        onHide={() => hideSection("recovery")}
+      >
         {r ? (
           <RecoveryCard
             r={r}
@@ -2395,8 +2396,10 @@ function App() {
           </p>
         )}
       </Section>
+      )}
 
-      <Section title="Today">
+      {!isSectionHidden("today") && (
+      <Section title="Today" editMode={editMode} onHide={() => hideSection("today")}>
         <div className="flex items-center justify-end -mt-1 mb-1">
           <button
             onClick={onToggleLiveStream}
@@ -2511,8 +2514,10 @@ function App() {
           </p>
         )}
       </Section>
+      )}
 
-      <Section title="Latest sleep">
+      {!isSectionHidden("latest_sleep") && (
+      <Section title="Latest sleep" editMode={editMode} onHide={() => hideSection("latest_sleep")}>
         {s ? (
           <div className="flex flex-col gap-2">
             <div className="flex items-baseline justify-between gap-2 flex-wrap">
@@ -2539,6 +2544,14 @@ function App() {
                 <HypnogramStrip
                   hypnogram={sleepSnapshot.hypnogram}
                   cycleCount={sleepSnapshot.cycle_count}
+                  onClick={() =>
+                    setZoomedHypnogram({
+                      title: s.night,
+                      subtitle: `${formatTime(s.start)} → ${formatTime(s.end)}`,
+                      hypnogram: sleepSnapshot.hypnogram,
+                      cycleCount: sleepSnapshot.cycle_count,
+                    })
+                  }
                 />
               </>
             )}
@@ -2585,8 +2598,14 @@ function App() {
                     </span>
                   </span>
                 )}
+                {/* Hide if implausible. Per-night need clamps to ≤ 10.5h
+                    (MAX_SLEEP_NEED_HOURS), so a per-night avg deficit can't
+                    legitimately exceed ~10h — anything larger means upstream
+                    staging is mislabeling units somewhere and we'd rather
+                    show nothing than a nonsense number like "18.7h/night". */}
                 {sleepSnapshot.sleep_debt_hours != null &&
-                  sleepSnapshot.sleep_debt_hours > 0.1 && (
+                  sleepSnapshot.sleep_debt_hours > 0.1 &&
+                  sleepSnapshot.sleep_debt_hours <= 10 && (
                     <span
                       className={
                         sleepSnapshot.sleep_debt_hours > 1
@@ -2690,8 +2709,10 @@ function App() {
           </p>
         )}
       </Section>
+      )}
 
-      <Section title="Last 7 days">
+      {!isSectionHidden("week") && (
+      <Section title="Last 7 days" editMode={editMode} onHide={() => hideSection("week")}>
         {w && (w.sleep_nights > 0 || w.workout_count > 0) ? (
           <div className="grid grid-cols-2 gap-4">
             <Stat
@@ -2730,9 +2751,10 @@ function App() {
           <p className="text-xs text-zinc-500">Nothing logged this week.</p>
         )}
       </Section>
+      )}
 
-      {dailySnapshot && (
-        <Section title="Today's activity">
+      {dailySnapshot && !isSectionHidden("activity") && (
+        <Section title="Today's activity" editMode={editMode} onHide={() => hideSection("activity")}>
           <div className="flex flex-col gap-3">
             {dailySnapshot.today_wear_minutes > 0 && (
               <div className="flex items-baseline justify-between text-xs">
@@ -2755,10 +2777,13 @@ function App() {
             {dailySnapshot.today_hrv_samples.length > 0 && (
               <HrvSparkline samples={dailySnapshot.today_hrv_samples} />
             )}
-            <EventsList events={dailySnapshot.recent_events} />
+            {debugMode && (
+              <EventsList events={dailySnapshot.recent_events} />
+            )}
             {dailySnapshot.today_wear_minutes === 0 &&
               dailySnapshot.today_hrv_samples.length === 0 &&
-              dailySnapshot.recent_events.length === 0 && (
+              (!debugMode ||
+                dailySnapshot.recent_events.length === 0) && (
                 <p className="text-xs text-zinc-500">
                   No data today yet. Run <em>detect-events</em> after a sync.
                 </p>
@@ -2766,7 +2791,56 @@ function App() {
           </div>
         </Section>
       )}
+
+      {editMode && (
+        hiddenSections.length > 0 ? (
+          <div
+            className={
+              "rounded-xl border border-dashed border-zinc-700/60 bg-zinc-950/40 p-3 mt-2 flex flex-col gap-2 " +
+              (mode === "expanded" ? "col-span-2" : "")
+            }
+          >
+            <h3 className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">
+              Available widgets
+            </h3>
+            <div className="flex flex-wrap gap-2">
+              {hiddenSections.map((id) => (
+                <button
+                  key={id}
+                  onClick={() => showSection(id)}
+                  className="flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-900/60 px-3 py-1.5 text-xs text-zinc-200 hover:border-emerald-500/50 hover:bg-zinc-900 transition-colors"
+                  title={`Add ${SECTION_LABELS[id]} back to the Now page`}
+                >
+                  <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-emerald-500 text-white text-xs font-bold leading-none">
+                    +
+                  </span>
+                  {SECTION_LABELS[id]}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <p
+            className={
+              "text-[11px] text-zinc-600 italic mt-2 " +
+              (mode === "expanded" ? "col-span-2" : "")
+            }
+          >
+            All widgets are showing. Click − on any widget to hide it.
+          </p>
+        )
+      )}
       </div>
+      )}
+
+      {zoomedHypnogram && (
+        <HypnogramModal
+          title={zoomedHypnogram.title}
+          subtitle={zoomedHypnogram.subtitle}
+          hypnogram={zoomedHypnogram.hypnogram}
+          cycleCount={zoomedHypnogram.cycleCount}
+          onClose={() => setZoomedHypnogram(null)}
+        />
       )}
     </main>
   );

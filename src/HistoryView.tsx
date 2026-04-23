@@ -9,23 +9,15 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
   DailyRollup,
-  HypnogramEntry,
   NightEntry,
   SleepHistory,
-  SleepStage,
 } from "./types";
-
-// Theme-aware stage colors. The CSS variables are defined in App.css and
-// flip to darker shades under `[data-theme="light"]` so the thumbnails
-// stay legible on near-white backgrounds. Keeping the lookup as a Record
-// so call sites don't change.
-const STAGE_COLOR: Record<SleepStage, string> = {
-  Wake: "var(--stage-wake)",
-  Light: "var(--stage-light)",
-  REM: "var(--stage-rem)",
-  Deep: "var(--stage-deep)",
-  Unknown: "var(--stage-unknown)",
-};
+import {
+  HypnogramModal,
+  SkylineHypnogram,
+  STAGE_COLOR,
+  STAGE_DEPTH_THUMB,
+} from "./Hypnogram";
 
 const ACTIVITY_COLOR = {
   sedentary: "#475569", // slate-600
@@ -122,74 +114,6 @@ function HistorySkeleton() {
   );
 }
 
-/** Fractional bar height per stage for the thumbnail "skyline" view.
- *
- * Height doubles as a visual weight for *recovery contribution*: Deep
- * sits at the top (biggest block), then REM, then Light, with Wake
- * nearly flat. This makes restorative sleep legible at a glance even
- * at 24px row height and in any theme — colored blocks carry enough
- * mass that they don't depend on thin-line contrast. */
-const STAGE_DEPTH: Record<SleepStage, number> = {
-  Wake: 0.18,
-  Light: 0.42,
-  REM: 0.68,
-  Deep: 1.0,
-  Unknown: 0.08,
-};
-
-/** One night's hypnogram rendered as a compact "skyline" thumbnail.
- *
- * Each timeline slice is a filled rectangle whose height encodes sleep
- * depth and whose color encodes stage. Tall indigo blocks = deep sleep
- * (front-loaded nights are obvious). Short slate dips = wake events.
- *
- * This replaces the earlier stepped-line thumbnail which had poor
- * visual weight at small scale, especially against light-theme
- * near-white backgrounds. */
-function HypnogramThumb({ hypnogram }: { hypnogram: HypnogramEntry[] }) {
-  if (hypnogram.length === 0) {
-    return (
-      <div className="h-6 w-full rounded-sm bg-zinc-800/40" />
-    );
-  }
-
-  const VB_W = 400;
-  const VB_H = 24;
-  const padT = 1;
-  const padB = 1;
-  const chartH = VB_H - padT - padB;
-
-  const t0 = new Date(hypnogram[0].start).getTime();
-  const t1 = new Date(hypnogram[hypnogram.length - 1].end).getTime();
-  const tSpan = Math.max(1, t1 - t0);
-  const x = (time: number) => ((time - t0) / tSpan) * VB_W;
-
-  return (
-    <svg
-      viewBox={`0 0 ${VB_W} ${VB_H}`}
-      preserveAspectRatio="none"
-      className="h-6 w-full rounded-sm bg-zinc-800/40"
-    >
-      {hypnogram.map((h, i) => {
-        const x0 = x(new Date(h.start).getTime());
-        const x1v = x(new Date(h.end).getTime());
-        const depth = STAGE_DEPTH[h.stage as SleepStage] ?? STAGE_DEPTH.Unknown;
-        const rh = chartH * depth;
-        const w = Math.max(0.5, x1v - x0);
-        return (
-          <rect
-            key={i}
-            x={x0}
-            y={VB_H - padB - rh}
-            width={w}
-            height={rh}
-            fill={STAGE_COLOR[h.stage as SleepStage] ?? STAGE_COLOR.Unknown}
-          />
-        );
-      })}
-    </svg>
-  );
-}
 
 /** Score trend — inline SVG line chart with interactive hover tooltip. */
 function ScoreTrend({ nights }: { nights: NightEntry[] }) {
@@ -773,8 +697,15 @@ function ChartTooltip({
   );
 }
 
-/** Hypnogram thumbnail row (one per night), sorted by sleep_id ascending. */
-function HypnogramRow({ nights }: { nights: NightEntry[] }) {
+/** Hypnogram thumbnail row (one per night), sorted by sleep_id ascending.
+ *  Click a thumbnail to open the night in a zoom modal for closer inspection. */
+function HypnogramRow({
+  nights,
+  onZoom,
+}: {
+  nights: NightEntry[];
+  onZoom: (n: NightEntry) => void;
+}) {
   if (nights.length === 0) {
     return (
       <p className="text-[10px] text-zinc-600">
@@ -784,9 +715,19 @@ function HypnogramRow({ nights }: { nights: NightEntry[] }) {
   }
   return (
     <div className="flex flex-col gap-1">
-      <span className="text-[10px] uppercase tracking-wider text-zinc-500">
-        Hypnograms
-      </span>
+      <div className="flex items-baseline justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+          Hypnograms
+        </span>
+        <span className="text-[9px] text-zinc-600">
+          tap to zoom · right column = sleep score
+        </span>
+      </div>
+      <div className="flex items-center gap-2 px-1 text-[9px] uppercase tracking-wider text-zinc-600">
+        <span className="w-14 shrink-0">Date</span>
+        <span className="flex-1" aria-hidden />
+        <span className="w-10 shrink-0 text-right">Score</span>
+      </div>
       <div className="flex flex-col gap-[2px]">
         {nights.map((n) => (
           <div
@@ -797,7 +738,18 @@ function HypnogramRow({ nights }: { nights: NightEntry[] }) {
               {fmtDateShort(nightOf(n.sleep_start))}
             </span>
             <div className="flex-1">
-              <HypnogramThumb hypnogram={n.hypnogram} />
+              <SkylineHypnogram
+                hypnogram={n.hypnogram}
+                heightClass="h-6"
+                vbWidth={400}
+                vbHeight={24}
+                padding={{ l: 0, r: 0, t: 1, b: 1 }}
+                depths={STAGE_DEPTH_THUMB}
+                background="bg-zinc-800/40"
+                transitionRadiusCap={4}
+                onClick={() => onZoom(n)}
+                ariaLabel={`Open hypnogram for ${nightOf(n.sleep_start)} in close-up view`}
+              />
             </div>
             <span className="w-10 shrink-0 text-right text-[10px] text-zinc-400 tabular-nums">
               {n.performance_score != null
@@ -932,10 +884,19 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
   );
 }
 
-export function HistoryView({ visible }: { visible: boolean }) {
+export function HistoryView({
+  visible,
+  mode = "compact",
+}: {
+  visible: boolean;
+  /** "expanded" widens the section into two columns so daytime stats sit
+   *  beside sleep stats; "compact" keeps the original single-column flow. */
+  mode?: "compact" | "expanded";
+}) {
   const [history, setHistory] = useState<SleepHistory | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [zoomed, setZoomed] = useState<NightEntry | null>(null);
 
   useEffect(() => {
     if (!visible) return;
@@ -980,20 +941,86 @@ export function HistoryView({ visible }: { visible: boolean }) {
 
   if (!history) return null;
 
-  return (
-    <section className="flex flex-col gap-5 pb-4 min-w-0 max-w-full">
+  // In expanded mode, sleep stats sit on the left and daytime stats on
+  // the right so the wider window doesn't waste horizontal space. Compact
+  // keeps the original single-column flow that fits the tray.
+  const isWide = mode === "expanded";
+  const sleepBlock = (
+    <div className="flex flex-col gap-5 min-w-0">
       <div className="flex items-baseline justify-between">
-        <h2 className="text-sm font-medium text-zinc-200">Last 14 nights</h2>
-        <span className="text-[10px] text-zinc-500 tabular-nums">
-          {fmtDateDay(history.range_start)} → {fmtDateDay(history.range_end)}
-        </span>
+        <h2 className="text-sm font-medium text-zinc-200">
+          Sleep — last 14 nights
+        </h2>
+        {!isWide && (
+          <span className="text-[10px] text-zinc-500 tabular-nums">
+            {fmtDateDay(history.range_start)} → {fmtDateDay(history.range_end)}
+          </span>
+        )}
       </div>
-
       <ScoreTrend nights={sortedNights} />
       <StageCompositionRow nights={sortedNights} />
-      <HypnogramRow nights={sortedNights} />
+      <HypnogramRow nights={sortedNights} onZoom={setZoomed} />
+    </div>
+  );
+  const daytimeBlock = (
+    <div className="flex flex-col gap-5 min-w-0">
+      <div
+        className={
+          isWide
+            ? "flex items-baseline justify-between"
+            : "flex items-baseline justify-between border-t border-zinc-800/60 pt-3"
+        }
+      >
+        <h2 className="text-sm font-medium text-zinc-200">
+          Daytime — last 14 days
+        </h2>
+      </div>
       <HrvTrend nights={sortedNights} daily={history.daily} />
       <WearActivityRow daily={history.daily} />
+    </div>
+  );
+
+  return (
+    <section className="flex flex-col gap-5 pb-4 min-w-0 max-w-full">
+      {isWide && (
+        <div className="flex items-baseline justify-between">
+          <h2 className="text-sm font-medium text-zinc-200">Last 14 days</h2>
+          <span className="text-[10px] text-zinc-500 tabular-nums">
+            {fmtDateDay(history.range_start)} → {fmtDateDay(history.range_end)}
+          </span>
+        </div>
+      )}
+      {isWide ? (
+        <div className="grid grid-cols-2 gap-x-8 gap-y-5 auto-rows-min">
+          {sleepBlock}
+          {daytimeBlock}
+        </div>
+      ) : (
+        <>
+          {sleepBlock}
+          {daytimeBlock}
+        </>
+      )}
+
+      {zoomed && (
+        <HypnogramModal
+          title={fmtDateDay(nightOf(zoomed.sleep_start))}
+          subtitle={`${new Date(zoomed.sleep_start).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          })} → ${new Date(zoomed.sleep_end).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}${
+            zoomed.performance_score != null
+              ? ` · score ${Math.round(zoomed.performance_score)}`
+              : ""
+          }`}
+          hypnogram={zoomed.hypnogram}
+          cycleCount={null}
+          onClose={() => setZoomed(null)}
+        />
+      )}
     </section>
   );
 }
