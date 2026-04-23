@@ -763,18 +763,32 @@ function HypnogramRow({
   );
 }
 
-/** Stage composition stacked-bar row with custom hover tooltip. */
+/** Stage composition stacked-bar row with custom hover tooltip.
+ *
+ * The bar stacks to the full **time in bed** (`sleep_end − sleep_start`),
+ * not just the sum of classified stages. Epochs that failed the
+ * classifier's validity gate (low HR coverage, high ectopic ratio, etc.)
+ * are rendered as a neutral "Unknown" segment so the bar height matches
+ * the Duration shown on the Now page. Without this, the bar would
+ * silently shrink whenever the classifier had data gaps, and a night's
+ * Stage composition total would disagree with its Duration. */
 function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
   const [hovered, setHovered] = useState<number | null>(null);
   if (nights.length === 0) return null;
 
-  const maxTotal = Math.max(
-    ...nights.map(
-      (n) =>
-        n.stages.awake_min + n.stages.light_min + n.stages.deep_min + n.stages.rem_min,
-    ),
-    1,
-  );
+  const tibMinutes = (n: NightEntry): number =>
+    Math.max(
+      0,
+      (new Date(n.sleep_end).getTime() - new Date(n.sleep_start).getTime()) / 60000,
+    );
+  const unknownMinutes = (n: NightEntry): number =>
+    Math.max(
+      0,
+      tibMinutes(n) -
+        (n.stages.awake_min + n.stages.light_min + n.stages.deep_min + n.stages.rem_min),
+    );
+
+  const maxTotal = Math.max(...nights.map(tibMinutes), 1);
 
   return (
     <div className="flex flex-col gap-1">
@@ -787,6 +801,7 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
       >
         {nights.map((n, i) => {
           const s = n.stages;
+          const u = unknownMinutes(n);
           return (
             <div
               key={`${n.sleep_id}-${n.sleep_start}`}
@@ -799,6 +814,14 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
                   style={{
                     height: `${(s.awake_min / maxTotal) * 100}%`,
                     backgroundColor: STAGE_COLOR.Wake,
+                  }}
+                />
+              )}
+              {u > 0 && (
+                <div
+                  style={{
+                    height: `${(u / maxTotal) * 100}%`,
+                    backgroundColor: STAGE_COLOR.Unknown,
                   }}
                 />
               )}
@@ -832,7 +855,8 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
         {hovered !== null && (() => {
           const n = nights[hovered];
           const s = n.stages;
-          const total = s.awake_min + s.light_min + s.deep_min + s.rem_min;
+          const u = unknownMinutes(n);
+          const tib = tibMinutes(n);
           return (
             <ChartTooltip
               leftPct={((hovered + 0.5) / nights.length) * 100}
@@ -842,7 +866,7 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
                 {fmtDateDay(nightOf(n.sleep_start))}
               </div>
               <div className="text-[10px] text-zinc-400">
-                total {fmtMinutes(total)}
+                time in bed {fmtMinutes(tib)}
               </div>
               <div className="mt-1 flex flex-col gap-0.5 text-[10px]">
                 <TooltipRow
@@ -865,6 +889,13 @@ function StageCompositionRow({ nights }: { nights: NightEntry[] }) {
                   label="Wake"
                   value={fmtMinutes(s.awake_min)}
                 />
+                {u > 0 && (
+                  <TooltipRow
+                    color={STAGE_COLOR.Unknown}
+                    label="Unclassified"
+                    value={fmtMinutes(u)}
+                  />
+                )}
               </div>
             </ChartTooltip>
           );

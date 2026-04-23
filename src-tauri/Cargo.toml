@@ -1,6 +1,6 @@
 [package]
 name = "openwhoop-tray"
-version = "0.1.3"
+version = "0.1.4"
 description = "OpenWhoop tray app"
 authors = ["Brennen Awana <brennen@xargz.com>"]
 edition = "2021"

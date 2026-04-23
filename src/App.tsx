@@ -174,14 +174,27 @@ function HypnogramStrip({
 // proportional to stage minutes. Segments below ~2% of total are
 // omitted from the bar (too narrow to be meaningful visually)
 // but still counted in the legend.
-function StageBreakdownBar({ stages }: { stages: SleepStageTotals }) {
-  const total =
+function StageBreakdownBar({
+  stages,
+  tibMinutes,
+}: {
+  stages: SleepStageTotals;
+  tibMinutes: number;
+}) {
+  const classified =
     stages.awake_min + stages.light_min + stages.deep_min + stages.rem_min;
-  if (total <= 0) {
+  const unknown = Math.max(0, tibMinutes - classified);
+  const total = Math.max(classified + unknown, 1);
+  if (classified + unknown <= 0) {
     return null;
   }
+  // Stacked proportional to time in bed, matching the History page's
+  // Stage composition bars. Unknown ("unclassified") time is shown
+  // instead of silently excluded so the bar's total agrees with the
+  // Duration stat.
   const entries: [SleepStage, number][] = [
     ["Wake", stages.awake_min],
+    ["Unknown", unknown],
     ["Light", stages.light_min],
     ["Deep", stages.deep_min],
     ["REM", stages.rem_min],
@@ -205,16 +218,20 @@ function StageBreakdownBar({ stages }: { stages: SleepStageTotals }) {
           );
         })}
       </div>
-      <div className="flex gap-3 text-[10px] text-zinc-400 tabular-nums">
-        {entries.map(([stage, min]) => (
-          <span key={stage} className="inline-flex items-center gap-1">
-            <span
-              className="inline-block h-2 w-2 rounded-sm"
-              style={{ backgroundColor: STAGE_COLOR[stage] }}
-            />
-            {stage} {Math.round(min)}m
-          </span>
-        ))}
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-zinc-400 tabular-nums">
+        {entries.map(([stage, min]) => {
+          if (stage === "Unknown" && min <= 0) return null;
+          const label = stage === "Unknown" ? "Unclassified" : stage;
+          return (
+            <span key={stage} className="inline-flex items-center gap-1">
+              <span
+                className="inline-block h-2 w-2 rounded-sm"
+                style={{ backgroundColor: STAGE_COLOR[stage] }}
+              />
+              {label} {Math.round(min)}m
+            </span>
+          );
+        })}
       </div>
     </div>
   );
@@ -2575,7 +2592,10 @@ function App() {
               />
             </div>
             {sleepSnapshot && (
-              <StageBreakdownBar stages={sleepSnapshot.stages} />
+              <StageBreakdownBar
+                stages={sleepSnapshot.stages}
+                tibMinutes={s.duration_minutes}
+              />
             )}
             {sleepSnapshot?.score_components && (
               <ScoreComponentBars c={sleepSnapshot.score_components} />
