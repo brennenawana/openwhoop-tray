@@ -32,7 +32,7 @@ Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com
 
 ## Screenshots
 
-![Now dashboard](docs/screenshots/now.png)
+![Now dashboard](docs/screenshots/now-v2.png)
 
 | History | Customize layout | Settings |
 |---|---|---|
