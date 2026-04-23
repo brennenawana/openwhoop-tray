@@ -55,39 +55,33 @@ Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com
 - **Device discovery** — scan for nearby WHOOP straps from the settings panel instead of typing the name manually.
 - **Launch at login** — macOS LaunchAgent integration.
 
-## Install (release build)
+## Install
 
-A pre-built `.app` bundle is in `src-tauri/target/release/bundle/macos/` after running the build:
+**macOS (Apple Silicon):** download the latest `.dmg` from [Releases](https://github.com/brennenawana/openwhoop-tray/releases/latest), open it, and drag **OpenWhoop.app** to **Applications**.
+
+The build is ad-hoc signed but not notarized, so macOS Gatekeeper will block the first launch. Either:
+
+- **Right-click** the app → **Open** → **Open** (one-time prompt), or
+- From a terminal: `xattr -dr com.apple.quarantine /Applications/OpenWhoop.app`
+
+On first launch, approve the Bluetooth permission prompt. The app runs in the menu bar (no Dock icon) — click the tray icon to open the dashboard.
+
+Intel Macs, Linux, and Windows builds aren't published yet — build from source.
+
+## Build from source
 
 ```sh
+git clone --recursive https://github.com/brennenawana/openwhoop-tray
+cd openwhoop-tray
+pnpm install
 pnpm tauri build
 ```
 
-Then copy to Applications:
+Forgot `--recursive`? Run `git submodule update --init --recursive`.
 
-```sh
-cp -R src-tauri/target/release/bundle/macos/OpenWhoop.app /Applications/
-open /Applications/OpenWhoop.app
-```
+Outputs land in `src-tauri/target/release/bundle/macos/OpenWhoop.app` and `.../bundle/dmg/`.
 
-A `.dmg` is also produced at `src-tauri/target/release/bundle/dmg/OpenWhoop_0.1.0_aarch64.dmg`.
-
-On first launch, macOS will prompt for Bluetooth permission — approve it once.
-
-## Development
-
-```sh
-git clone --recursive <repo-url>
-cd openwhoop-tray
-pnpm install
-pnpm tauri dev
-```
-
-If you already cloned without `--recursive`:
-
-```sh
-git submodule update --init --recursive
-```
+For live development (hot-reload frontend, faster Rust builds): `pnpm tauri dev`.
 
 ## Architecture
 
@@ -114,10 +108,18 @@ The Rust backend owns the BLE connection, SQLite database, and all algorithms. T
 
 Contains `db.sqlite` (all health data) and `config.json` (device name, sync interval, presence interval).
 
-## Distribution
+## Publishing a release
 
-To distribute to others:
+1. Bump `version` in [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json).
+2. `pnpm tauri build` to produce `OpenWhoop.app` and the `.dmg`.
+3. Ad-hoc sign: `codesign --force --deep --sign - src-tauri/target/release/bundle/macos/OpenWhoop.app`.
+4. Tag: `git tag -a vX.Y.Z -m "OpenWhoop Tray vX.Y.Z" && git push origin vX.Y.Z`.
+5. Create the GitHub release and attach the `.dmg`:
+   ```sh
+   gh release create vX.Y.Z \
+     src-tauri/target/release/bundle/dmg/OpenWhoop_X.Y.Z_aarch64.dmg \
+     --title "OpenWhoop Tray vX.Y.Z" \
+     --notes "Release notes here"
+   ```
 
-1. `pnpm tauri build` produces `OpenWhoop.app` and a `.dmg`
-2. Ad-hoc sign: `codesign --force --deep --sign - OpenWhoop.app`
-3. For proper distribution, sign with an Apple Developer ID certificate and notarize via `xcrun notarytool`
+For a clean Gatekeeper experience (no right-click-Open prompt), sign with an Apple Developer ID certificate and notarize via `xcrun notarytool` before attaching to the release.
