@@ -443,8 +443,14 @@ async fn run_live_stream(app: AppHandle) -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
-    // Live-stream uses Gen4-only characteristic helpers — ignore generation.
-    let (peripheral, _generation) = scan_for_device(&adapter, &device_name).await?;
+    // Live-stream uses Gen4-only characteristic UUIDs and Gen4-framed packet
+    // parsing. Gen5 would need different UUIDs + WhoopPacket::from_data_maverick;
+    // not yet implemented. Fail early with a clear message rather than opening
+    // a connection that silently produces garbage.
+    let (peripheral, generation) = scan_for_device(&adapter, &device_name).await?;
+    if generation != WhoopGeneration::Gen4 {
+        anyhow::bail!("Live stream is only supported on Whoop 4.0 straps (detected {:?})", generation);
+    }
     peripheral.connect().await?;
     let _ = adapter.stop_scan().await;
     peripheral.discover_services().await?;
@@ -1044,7 +1050,7 @@ async fn scan_devices(app: AppHandle) -> Result<Vec<DiscoveredDevice>, String> {
 
     adapter
         .start_scan(ScanFilter {
-            services: vec![WHOOP_SERVICE],
+            services: ALL_WHOOP_SERVICES.to_vec(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -1059,7 +1065,7 @@ async fn scan_devices(app: AppHandle) -> Result<Vec<DiscoveredDevice>, String> {
         let Ok(Some(props)) = p.properties().await else {
             continue;
         };
-        if !props.services.contains(&WHOOP_SERVICE) {
+        if !ALL_WHOOP_SERVICES.iter().any(|s| props.services.contains(s)) {
             continue;
         }
         if let Some(name) = props.local_name {
@@ -2048,7 +2054,7 @@ async fn quick_presence_scan(device_name: &str) -> bool {
     };
     if adapter
         .start_scan(ScanFilter {
-            services: vec![WHOOP_SERVICE],
+            services: ALL_WHOOP_SERVICES.to_vec(),
         })
         .await
         .is_err()
@@ -2061,7 +2067,7 @@ async fn quick_presence_scan(device_name: &str) -> bool {
         if let Ok(peripherals) = adapter.peripherals().await {
             for p in peripherals {
                 if let Ok(Some(props)) = p.properties().await {
-                    if !props.services.contains(&WHOOP_SERVICE) {
+                    if !ALL_WHOOP_SERVICES.iter().any(|s| props.services.contains(s)) {
                         continue;
                     }
                     if let Some(name) = props.local_name {
