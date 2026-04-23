@@ -68,6 +68,31 @@ On first launch, approve the Bluetooth permission prompt. The app runs in the me
 
 Intel Macs, Linux, and Windows builds aren't published yet — build from source.
 
+## Uninstall
+
+1. Quit OpenWhoop from the tray menu, then drag **OpenWhoop.app** to the Trash.
+2. Remove the data directory:
+   ```sh
+   rm -rf ~/Library/Application\ Support/dev.brennen.openwhoop-tray
+   ```
+3. If you enabled "Launch at login", remove the LaunchAgent:
+   ```sh
+   launchctl unload ~/Library/LaunchAgents/OpenWhoop.plist 2>/dev/null
+   rm ~/Library/LaunchAgents/OpenWhoop.plist
+   ```
+
+## Data location
+
+| Platform | Path |
+|---|---|
+| macOS | `~/Library/Application Support/dev.brennen.openwhoop-tray/` |
+| Linux | `~/.local/share/dev.brennen.openwhoop-tray/` |
+| Windows | `%APPDATA%\dev.brennen.openwhoop-tray\` |
+
+Contains `db.sqlite` (all health data) and `config.json` (device name, sync interval, presence interval).
+
+---
+
 ## Build from source
 
 ```sh
@@ -97,16 +122,6 @@ openwhoop-tray/
 ```
 
 The Rust backend owns the BLE connection, SQLite database, and all algorithms. The React frontend is pure presentation — it calls Tauri commands and renders results.
-
-## Data location
-
-| Platform | Path |
-|---|---|
-| macOS | `~/Library/Application Support/dev.brennen.openwhoop-tray/` |
-| Linux | `~/.local/share/dev.brennen.openwhoop-tray/` |
-| Windows | `%APPDATA%\dev.brennen.openwhoop-tray\` |
-
-Contains `db.sqlite` (all health data) and `config.json` (device name, sync interval, presence interval).
 
 ## Publishing a release
 
