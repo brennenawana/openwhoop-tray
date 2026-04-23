@@ -57,12 +57,12 @@ Built with Tauri 2, React 19, Tailwind 4, and the [openwhoop](https://github.com
 
 ## Install
 
-**macOS (Apple Silicon):** download the latest `.dmg` from [Releases](https://github.com/brennenawana/openwhoop-tray/releases/latest), open it, and drag **OpenWhoop.app** to **Applications**.
+**macOS (Apple Silicon):** download the latest `.dmg` from [Releases](https://github.com/brennenawana/openwhoop-tray/releases/latest), open it, and drag **OpenWhoop Tray.app** to **Applications**.
 
 The build is ad-hoc signed but not notarized, so macOS Gatekeeper will block the first launch. Either:
 
 - **Right-click** the app → **Open** → **Open** (one-time prompt), or
-- From a terminal: `xattr -dr com.apple.quarantine /Applications/OpenWhoop.app`
+- From a terminal: `xattr -dr com.apple.quarantine "/Applications/OpenWhoop Tray.app"`
 
 On first launch, approve the Bluetooth permission prompt. The app runs in the menu bar (no Dock icon) — click the tray icon to open the dashboard.
 
@@ -70,15 +70,15 @@ Intel Macs, Linux, and Windows builds aren't published yet — build from source
 
 ## Uninstall
 
-1. Quit OpenWhoop from the tray menu, then drag **OpenWhoop.app** to the Trash.
+1. Quit OpenWhoop Tray from the tray menu, then drag **OpenWhoop Tray.app** to the Trash.
 2. Remove the data directory:
    ```sh
    rm -rf ~/Library/Application\ Support/dev.brennen.openwhoop-tray
    ```
 3. If you enabled "Launch at login", remove the LaunchAgent:
    ```sh
-   launchctl unload ~/Library/LaunchAgents/OpenWhoop.plist 2>/dev/null
-   rm ~/Library/LaunchAgents/OpenWhoop.plist
+   launchctl unload ~/Library/LaunchAgents/"OpenWhoop Tray.plist" 2>/dev/null
+   rm ~/Library/LaunchAgents/"OpenWhoop Tray.plist"
    ```
 
 ## Data location
@@ -104,7 +104,7 @@ pnpm tauri build
 
 Forgot `--recursive`? Run `git submodule update --init --recursive`.
 
-Outputs land in `src-tauri/target/release/bundle/macos/OpenWhoop.app` and `.../bundle/dmg/`.
+Outputs land in `src-tauri/target/release/bundle/macos/OpenWhoop Tray.app` and `.../bundle/dmg/`.
 
 For live development (hot-reload frontend, faster Rust builds): `pnpm tauri dev`.
 
@@ -125,14 +125,14 @@ The Rust backend owns the BLE connection, SQLite database, and all algorithms. T
 
 ## Publishing a release
 
-1. Bump `version` in [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json).
-2. `pnpm tauri build` to produce `OpenWhoop.app` and the `.dmg`.
-3. Ad-hoc sign: `codesign --force --deep --sign - src-tauri/target/release/bundle/macos/OpenWhoop.app`.
+1. Bump `version` in [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json), [src-tauri/Cargo.toml](src-tauri/Cargo.toml), and [package.json](package.json).
+2. `pnpm tauri build` to produce `OpenWhoop Tray.app` and the `.dmg`.
+3. Ad-hoc sign: `codesign --force --deep --sign - "src-tauri/target/release/bundle/macos/OpenWhoop Tray.app"`.
 4. Tag: `git tag -a vX.Y.Z -m "OpenWhoop Tray vX.Y.Z" && git push origin vX.Y.Z`.
 5. Create the GitHub release and attach the `.dmg`:
    ```sh
    gh release create vX.Y.Z \
-     src-tauri/target/release/bundle/dmg/OpenWhoop_X.Y.Z_aarch64.dmg \
+     "src-tauri/target/release/bundle/dmg/OpenWhoop Tray_X.Y.Z_aarch64.dmg" \
      --title "OpenWhoop Tray vX.Y.Z" \
      --notes "Release notes here"
    ```

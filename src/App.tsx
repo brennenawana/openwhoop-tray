@@ -1909,7 +1909,7 @@ function App() {
     >
       <header className="flex items-center justify-between">
         <div className="min-w-0">
-          <h1 className="text-lg font-semibold tracking-tight">OpenWhoop</h1>
+          <h1 className="text-lg font-semibold tracking-tight">OpenWhoop Tray</h1>
           <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 mt-1">
             {snapshot?.battery && (
               <>

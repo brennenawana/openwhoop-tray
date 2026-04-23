@@ -1788,7 +1788,7 @@ fn format_tray_status(
     if syncing {
         return (
             "Syncing…".to_string(),
-            "OpenWhoop\nSyncing with strap…".to_string(),
+            "OpenWhoop Tray\nSyncing with strap…".to_string(),
         );
     }
 
@@ -1797,7 +1797,7 @@ fn format_tray_status(
     if battery.is_none() && strap_seen.is_none() && last_sync.is_none() {
         return (
             "No data yet".to_string(),
-            "OpenWhoop\nWaiting for first sync".to_string(),
+            "OpenWhoop Tray\nWaiting for first sync".to_string(),
         );
     }
 
@@ -1828,7 +1828,7 @@ fn format_tray_status(
 
     let menu_text = format!("{} · {} · synced {}", battery_str, presence_str, sync_str);
 
-    let mut tooltip = String::from("OpenWhoop\n");
+    let mut tooltip = String::from("OpenWhoop Tray\n");
     if let Some(b) = battery {
         tooltip.push_str(&format!(
             "Battery: {:.1}%{}\nOn wrist: {}\n",
@@ -2166,7 +2166,7 @@ pub fn run() {
             let sync_item =
                 MenuItem::with_id(app, "sync", "Sync Now", true, None::<&str>)?;
             let quit_item =
-                MenuItem::with_id(app, "quit", "Quit OpenWhoop", true, None::<&str>)?;
+                MenuItem::with_id(app, "quit", "Quit OpenWhoop Tray", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[&status_item, &separator, &show_item, &sync_item, &quit_item],
