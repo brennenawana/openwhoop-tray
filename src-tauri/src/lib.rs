@@ -33,6 +33,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager as _, State, Wry,
+    image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
@@ -2171,8 +2172,12 @@ pub fn run() {
                 &[&status_item, &separator, &show_item, &sync_item, &quit_item],
             )?;
 
+            let tray_icon = Image::from_bytes(include_bytes!(
+                "../icons/tray-template@2x.png"
+            ))?;
             TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
+                .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
