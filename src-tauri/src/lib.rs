@@ -193,12 +193,15 @@ struct RecoverySection {
     z_sleep: Option<f64>,
     z_rr: Option<f64>,
     z_skin_temp: Option<f64>,
-    /// Raw RMSSD (ms) from this night — surfaced so the HRV ring can
-    /// show the underlying number alongside the age-normed score.
+    /// Raw RMSSD (ms) from this night — surfaced alongside the categorical
+    /// "above typical / in range / below range" badge so users can also
+    /// see the underlying number.
     hrv_rmssd_ms: Option<f64>,
-    /// HRV score against age-matched population norms (0–100). `None`
-    /// when no DOB is configured — the HRV ring then falls back to
-    /// displaying just the raw ms.
+    /// Age-normed HRV score (0–100) against published RMSSD population
+    /// percentiles. The frontend bins this into three bands rather than
+    /// showing the raw number, but we keep the score on the wire so the
+    /// binning thresholds can evolve without a backend change. `None`
+    /// when no DOB is configured.
     age_normed_hrv_score: Option<f64>,
 }
 
@@ -337,6 +340,24 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
 async fn cancel_sync(state: State<'_, AppState>) -> Result<(), String> {
     *state.sync_cancel_reason.write().await = Some(CancelReason::User);
     state.sync_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Force-clears in-memory state that can wedge the app: stuck `sync_in_progress`
+/// flag, lingering live-stream activity, pending cancel signal. Used by the UI
+/// refresh button as a recovery escape hatch when the app gets stuck reporting
+/// "sync already in progress" while no work is actually happening.
+#[tauri::command]
+async fn hard_reset(state: State<'_, AppState>) -> Result<(), String> {
+    state.sync_cancel.store(true, Ordering::SeqCst);
+    *state.sync_cancel_reason.write().await = Some(CancelReason::User);
+    state.live_cancel.notify_waiters();
+    state.live_active.store(false, Ordering::SeqCst);
+    *state.sync_in_progress.write().await = false;
+    state.sync_cancel.store(false, Ordering::SeqCst);
+    *state.sync_cancel_reason.write().await = None;
+    state.scheduler_notify.notify_waiters();
+    state.presence_notify.notify_waiters();
     Ok(())
 }
 
@@ -566,6 +587,62 @@ async fn get_sleep_history(
     openwhoop::sleep_history::get_sleep_history(&db, days)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Apply user-supplied bounds to a previously-detected sleep cycle.
+/// `sleep_id` is the YYYY-MM-DD key; `start_iso` / `end_iso` are
+/// ISO 8601 datetime strings (no timezone — naive local time, matching
+/// what the rest of the DB stores). Recomputes HR-derived metrics
+/// against the new window and invalidates staging so the next sync
+/// re-stages with fresh epochs.
+#[tauri::command]
+async fn set_sleep_override(
+    state: State<'_, AppState>,
+    sleep_id: String,
+    start_iso: String,
+    end_iso: String,
+) -> Result<(), String> {
+    let db_arc = ensure_db(&state).await?;
+    let sleep_id = chrono::NaiveDate::parse_from_str(&sleep_id, "%Y-%m-%d")
+        .map_err(|e| format!("invalid sleep_id (expected YYYY-MM-DD): {e}"))?;
+    let new_start = NaiveDateTime::parse_from_str(&start_iso, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(&start_iso, "%Y-%m-%dT%H:%M"))
+        .map_err(|e| format!("invalid start_iso: {e}"))?;
+    let new_end = NaiveDateTime::parse_from_str(&end_iso, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(&end_iso, "%Y-%m-%dT%H:%M"))
+        .map_err(|e| format!("invalid end_iso: {e}"))?;
+
+    let db: DatabaseHandler = (*db_arc).clone();
+    let whoop = OpenWhoop::new(db, WhoopGeneration::Placeholder);
+    whoop
+        .apply_sleep_override(sleep_id, new_start, new_end)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Re-stage immediately so the UI reflects new staging on next refetch
+    // rather than waiting for the next full sync cycle.
+    whoop.stage_sleep().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Restore a previously-overridden sleep cycle to the detector's
+/// original bounds. No-op if the cycle was never overridden.
+#[tauri::command]
+async fn clear_sleep_override(
+    state: State<'_, AppState>,
+    sleep_id: String,
+) -> Result<(), String> {
+    let db_arc = ensure_db(&state).await?;
+    let sleep_id = chrono::NaiveDate::parse_from_str(&sleep_id, "%Y-%m-%d")
+        .map_err(|e| format!("invalid sleep_id (expected YYYY-MM-DD): {e}"))?;
+
+    let db: DatabaseHandler = (*db_arc).clone();
+    let whoop = OpenWhoop::new(db, WhoopGeneration::Placeholder);
+    whoop
+        .clear_sleep_override(sleep_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    whoop.stage_sleep().await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- battery prediction
@@ -1548,9 +1625,19 @@ async fn build_snapshot(
             None
         });
 
+    // Per-user skin-temp calibration anchor. Pulled from the latest
+    // user_baseline row; non-fatal if missing — `build_today` then
+    // returns None for `latest_skin_temp` and the UI shows "Calibrating".
+    let skin_temp_raw_median = db
+        .get_latest_user_baseline()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| b.skin_temp_raw_median);
+
     Ok(Snapshot {
         generated_at: now,
-        today: build_today(&today_rows, hr_series),
+        today: build_today(&today_rows, hr_series, skin_temp_raw_median),
         latest_sleep: sleep_cycles.last().map(build_sleep_section),
         recovery,
         week: build_week(&sleep_cycles, &recent_activities, week_start)?,
@@ -1634,7 +1721,11 @@ async fn build_recovery_section(
     }))
 }
 
-fn build_today(rows: &[heart_rate::Model], series_rows: Vec<HrPoint>) -> TodaySection {
+fn build_today(
+    rows: &[heart_rate::Model],
+    series_rows: Vec<HrPoint>,
+    skin_temp_raw_median: Option<f64>,
+) -> TodaySection {
     if rows.is_empty() {
         return TodaySection {
             sample_count: 0,
@@ -1683,7 +1774,22 @@ fn build_today(rows: &[heart_rate::Model], series_rows: Vec<HrPoint>) -> TodaySe
         max_bpm: Some(max_bpm),
         latest_stress: rows.iter().rev().find_map(|r| r.stress),
         latest_spo2: rows.iter().rev().find_map(|r| r.spo2),
-        latest_skin_temp: rows.iter().rev().find_map(|r| r.skin_temp),
+        // Skin temp uses per-user calibration (`SkinTempCalibration`) when
+        // a baseline anchor exists. Without it, return None — the UI
+        // shows "Calibrating" instead of a known-bad raw conversion.
+        latest_skin_temp: skin_temp_raw_median.and_then(|median| {
+            rows.iter().rev().find_map(|r| {
+                let json = r.sensor_data.clone()?;
+                let sd: openwhoop_codec::SensorData = serde_json::from_value(json).ok()?;
+                if sd.skin_temp_raw < 100 {
+                    return None;
+                }
+                Some(openwhoop_algos::SkinTempCalibration::convert(
+                    sd.skin_temp_raw,
+                    median,
+                ))
+            })
+        }),
         hourly_bpm: hourly,
         hr_series: series_rows,
     }
@@ -2219,6 +2325,7 @@ pub fn run() {
             get_snapshot,
             sync_now,
             cancel_sync,
+            hard_reset,
             get_config,
             set_device_name,
             set_sync_interval,
@@ -2235,6 +2342,8 @@ pub fn run() {
             get_sleep_snapshot,
             get_daily_snapshot,
             get_sleep_history,
+            set_sleep_override,
+            clear_sleep_override,
             start_live_stream,
             stop_live_stream,
         ])

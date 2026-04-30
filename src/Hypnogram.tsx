@@ -341,6 +341,9 @@ export interface HypnogramModalProps {
   hypnogram: HypnogramEntry[];
   cycleCount?: number | null;
   onClose: () => void;
+  /** Optional content rendered below the hypnogram. Used to attach the
+   *  sleep-times editor to historical cycles. */
+  footer?: React.ReactNode;
 }
 
 /** Full-screen modal showing a hypnogram at increased size for close
@@ -351,6 +354,7 @@ export function HypnogramModal({
   hypnogram,
   cycleCount,
   onClose,
+  footer,
 }: HypnogramModalProps) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -399,6 +403,7 @@ export function HypnogramModal({
           showBaseline
           transitionRadiusCap={20}
         />
+        {footer}
       </div>
     </div>
   );

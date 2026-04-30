@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -18,6 +19,7 @@ import {
   STAGE_COLOR,
   STAGE_DEPTH_THUMB,
 } from "./Hypnogram";
+import { SleepTimesEditor } from "./App";
 
 const ACTIVITY_COLOR = {
   sedentary: "#475569", // slate-600
@@ -929,27 +931,36 @@ export function HistoryView({
   const [error, setError] = useState<string | null>(null);
   const [zoomed, setZoomed] = useState<NightEntry | null>(null);
 
+  const refetchHistory = useCallback(async () => {
+    setLoading(true);
+    try {
+      const h = await invoke<SleepHistory>("get_sleep_history", { days: 14 });
+      setHistory(h);
+      setError(null);
+      // Keep the open modal's data in sync if the user has it open while
+      // the override save propagates: pull the matching night out of the
+      // refreshed history list and re-point `zoomed` at it.
+      setZoomed((prev) => {
+        if (!prev) return prev;
+        return h.nights.find((n) => n.sleep_id === prev.sleep_id) ?? prev;
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!visible) return;
     let cancelled = false;
-    setLoading(true);
     (async () => {
-      try {
-        const h = await invoke<SleepHistory>("get_sleep_history", { days: 14 });
-        if (!cancelled) {
-          setHistory(h);
-          setError(null);
-        }
-      } catch (e) {
-        if (!cancelled) setError(String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+      if (!cancelled) await refetchHistory();
     })();
     return () => {
       cancelled = true;
     };
-  }, [visible]);
+  }, [visible, refetchHistory]);
 
   const sortedNights = useMemo(() => {
     if (!history) return [];
@@ -1050,6 +1061,16 @@ export function HistoryView({
           hypnogram={zoomed.hypnogram}
           cycleCount={null}
           onClose={() => setZoomed(null)}
+          footer={
+            <SleepTimesEditor
+              sleepId={zoomed.sleep_id}
+              start={zoomed.sleep_start}
+              end={zoomed.sleep_end}
+              originalStart={zoomed.original_start}
+              originalEnd={zoomed.original_end}
+              onSaved={refetchHistory}
+            />
+          }
         />
       )}
     </section>

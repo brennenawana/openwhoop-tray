@@ -37,8 +37,9 @@ export type RecoverySection = {
   z_rr: number | null;
   z_skin_temp: number | null;
   hrv_rmssd_ms: number | null;
-  /** 0–100 score of current HRV against published age-matched
-   * population RMSSD norms. Null when no DOB is configured. */
+  /** Age-normed HRV score (0-100) against published RMSSD population
+   * percentiles. The frontend bins this into a categorical band; null
+   * when no DOB is configured. */
   age_normed_hrv_score: number | null;
 };
 
@@ -169,6 +170,14 @@ export type SleepSnapshot = {
   classifier_version: string | null;
   /// Nights in the rolling user baseline (<14 = still calibrating).
   baseline_window_nights: number | null;
+  /// `sleep_id` (YYYY-MM-DD) — the unique key the override commands take.
+  sleep_id: string;
+  /// Detector's pre-override start, populated only when the user has
+  /// edited this cycle's bounds. Presence drives the "Edited" badge +
+  /// "Reset to detected" button.
+  original_start: string | null;
+  /// Mirror of `original_start` for the cycle's end bound.
+  original_end: string | null;
 };
 
 // ---- daily snapshot (get_daily_snapshot command) ----
@@ -248,6 +257,10 @@ export type NightEntry = {
   sleep_debt_hours: number | null;
   avg_hrv: number;
   classifier_version: string | null;
+  /// Detector's pre-override start, populated only when the user has
+  /// edited this cycle's bounds.
+  original_start: string | null;
+  original_end: string | null;
 };
 
 export type DailyRollup = {

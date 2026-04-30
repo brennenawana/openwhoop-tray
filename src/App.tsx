@@ -55,6 +55,15 @@ const SECTION_LABELS: Record<SectionId, string> = {
   activity: "Today's activity",
 };
 
+/** Ring widget IDs for the per-ring show/hide customization inside the
+ *  Recovery card. Recovery and Sleep are always shown (foundational);
+ *  HRV is opt-in per user preference but defaults to visible. */
+type RingId = "hrv";
+
+const RING_LABELS: Record<RingId, string> = {
+  hrv: "HRV",
+};
+
 type Theme = "monokai" | "midnight" | "slate" | "light";
 
 const THEME_OPTIONS: { value: Theme; label: string; hint: string }[] = [
@@ -950,13 +959,6 @@ function Stat({
 // regardless of score, so a user can learn "teal = recovery, indigo =
 // sleep, fuchsia = HRV" at a glance. Band status is shown separately
 // via a colored dot so we don't conflate "which metric" with "how good."
-//
-// Colors are chosen with these constraints:
-//   - Distinct hues (teal / indigo / fuchsia sit ~120° apart on the wheel).
-//   - Saturated enough to remain legible on dark backgrounds.
-//   - Tailwind's 400/500 shades — readable on both dark themes and any
-//     future light theme without changes, since they sit in the
-//     mid-luminance range.
 const RING_PALETTE = {
   recovery: {
     arc: "#2dd4bf", // teal-400
@@ -969,9 +971,30 @@ const RING_PALETTE = {
     text: "#a5b4fc", // indigo-300
   },
   hrv: {
-    arc: "#e879f9", // fuchsia-400
+    arc: "#e879f9", // fuchsia-400 (unused for HRV ring's arc — band drives color)
     track: "rgba(232, 121, 249, 0.15)",
     text: "#f0abfc", // fuchsia-300
+  },
+} as const;
+
+// Band-driven palette for the HRV ring. Unlike Recovery/Sleep (identity
+// hues), HRV's ring color encodes the answer to "is my HRV in a healthy
+// range" — green = above typical, amber = within range, rose = below.
+const BAND_RING_PALETTE = {
+  green: {
+    arc: "#10b981", // emerald-500
+    track: "rgba(16, 185, 129, 0.15)",
+    text: "#6ee7b7", // emerald-300
+  },
+  yellow: {
+    arc: "#f59e0b", // amber-500
+    track: "rgba(245, 158, 11, 0.15)",
+    text: "#fcd34d", // amber-300
+  },
+  red: {
+    arc: "#ef4444", // red-500
+    track: "rgba(239, 68, 68, 0.15)",
+    text: "#fca5a5", // red-300
   },
 } as const;
 
@@ -1083,12 +1106,121 @@ function RingGauge({
   );
 }
 
+/** Three-band classifier for the HRV ring. Mapped from
+ *  `age_normed_hrv_score` (0-100), which itself anchors on published
+ *  RMSSD population percentiles for the user's age:
+ *   - score >= 50 → at/above population p50 → "Above typical" (green)
+ *   - 25 <= score < 50 → between p10 and p50 → "In range" (amber)
+ *   - score < 25 → below p10 → "Below range" (red)
+ *  These thresholds intentionally align with population percentiles
+ *  rather than even thirds — "below p10 for your age" is the clinically
+ *  meaningful concern bucket. */
+function hrvBandFromAgeScore(score: number): {
+  band: "red" | "yellow" | "green";
+  label: string;
+} {
+  if (score >= 50) return { band: "green", label: "Above typical" };
+  if (score >= 25) return { band: "yellow", label: "In range" };
+  return { band: "red", label: "Below range" };
+}
+
+/** Categorical version of RingGauge for HRV. The ring color is driven
+ *  by the band (green/amber/rose) rather than a static identity hue, and
+ *  the center shows a band label instead of a number — so a glance
+ *  answers "is my HRV in a healthy range" without parsing a 0-100. */
+function CategoryRingGauge({
+  label,
+  band,
+  bandLabel,
+  size = 96,
+  subLabel,
+  title,
+}: {
+  label: string;
+  /** `null` → no DOB / no data; ring renders as a muted placeholder. */
+  band: "red" | "yellow" | "green" | null;
+  bandLabel: string;
+  size?: number;
+  subLabel?: React.ReactNode;
+  title?: string;
+}) {
+  const stroke = 8;
+  const radius = (size - stroke) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const colors = band ? BAND_RING_PALETTE[band] : null;
+
+  return (
+    <div className="flex flex-col items-center gap-1" title={title}>
+      <div
+        className="relative rounded-full"
+        style={{
+          width: size,
+          height: size,
+          backgroundColor: colors ? colors.track : "transparent",
+        }}
+      >
+        <svg width={size} height={size} className="-rotate-90">
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            stroke="currentColor"
+            className="text-zinc-800/80"
+            strokeWidth={stroke}
+            fill="none"
+          />
+          {colors && (
+            <circle
+              cx={size / 2}
+              cy={size / 2}
+              r={radius}
+              stroke={colors.arc}
+              strokeWidth={stroke}
+              fill="none"
+              strokeDasharray={circumference}
+              strokeDashoffset={0}
+              strokeLinecap="round"
+            />
+          )}
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center px-1">
+          <span
+            className="text-[10px] font-semibold leading-tight text-center"
+            style={{ color: colors ? colors.text : undefined }}
+          >
+            {bandLabel}
+          </span>
+          <span className="text-[9px] uppercase tracking-wider text-zinc-500 mt-0.5">
+            {label}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center justify-center gap-1.5 min-h-[14px]">
+        {subLabel &&
+          (typeof subLabel === "string" ? (
+            <span className="text-[10px] text-zinc-500 tabular-nums">
+              {subLabel}
+            </span>
+          ) : (
+            subLabel
+          ))}
+      </div>
+    </div>
+  );
+}
+
 function RecoveryCard({
   r,
   sleepPerformance,
+  hrvHidden,
+  editMode,
+  onHideHrv,
 }: {
   r: RecoverySection;
   sleepPerformance: number | null;
+  hrvHidden: boolean;
+  editMode: boolean;
+  onHideHrv: () => void;
 }) {
   const driverLabel: Record<RecoverySection["dominant_driver"], string> = {
     hrv: "low HRV",
@@ -1099,30 +1231,26 @@ function RecoveryCard({
     none: "no single driver",
   };
 
-  // HRV ring: age-normed absolute score (where does tonight's HRV sit
-  // against published population RMSSD percentiles for your age?). The
-  // baseline z-score becomes a trend annotation below the ring. If no
-  // DOB is set, score is null and the ring shows just the raw ms value.
-  const hrvScore = r.age_normed_hrv_score;
-  const hrvBand =
-    hrvScore != null ? bandFromScore(hrvScore) : ("yellow" as const);
-  const hrvRawMs = r.hrv_rmssd_ms;
-  const hrvSubLabel = (() => {
-    const parts: string[] = [];
-    if (hrvRawMs != null) parts.push(`${Math.round(hrvRawMs)} ms`);
-    if (r.z_hrv != null) {
-      const sign = r.z_hrv >= 0 ? "+" : "";
-      parts.push(`${sign}${r.z_hrv.toFixed(2)}σ`);
-    }
-    return parts.length > 0 ? parts.join(" · ") : undefined;
-  })();
-  const hrvTitle =
-    hrvScore != null
-      ? "HRV scored against published RMSSD norms for your age. 50 = typical, 85 = 90th percentile."
-      : "HRV ring shows raw RMSSD. Set your date of birth in Settings to get an age-normed 0–100 score.";
-
   const sleepBand =
     sleepPerformance != null ? bandFromScore(sleepPerformance) : ("yellow" as const);
+
+  // HRV ring inputs: age_normed_hrv_score → band + categorical label.
+  // When DOB is unset (score null) the ring renders muted with a hint.
+  const hrvScore = r.age_normed_hrv_score;
+  const hrvCategory =
+    hrvScore != null ? hrvBandFromAgeScore(hrvScore) : null;
+  const hrvBandLabel = hrvCategory?.label ?? "Set DOB";
+  const hrvBand = hrvCategory?.band ?? null;
+  const hrvSubLabel =
+    r.hrv_rmssd_ms != null ? (
+      <span className="text-[10px] text-zinc-500 tabular-nums">
+        {Math.round(r.hrv_rmssd_ms)} ms
+      </span>
+    ) : undefined;
+  const hrvTitle =
+    hrvScore != null
+      ? "HRV vs published RMSSD norms for your age. Above p50 = above typical, p10-p50 = in range, below p10 = below range."
+      : "HRV ring needs your date of birth to compare against age-matched norms. Set it in Settings.";
 
   // Recovery ring's caption: amber Calibrating pill while still building
   // baseline history, otherwise a quiet "vs N-night baseline" footnote.
@@ -1149,7 +1277,11 @@ function RecoveryCard({
           : `Main driver: ${driverLabel[r.dominant_driver]}.`}
       </p>
 
-      <div className="grid grid-cols-3 gap-2">
+      <div
+        className={
+          "grid gap-2 " + (hrvHidden ? "grid-cols-2" : "grid-cols-3")
+        }
+      >
         <RingTile>
           <RingGauge
             label="Recovery"
@@ -1176,17 +1308,18 @@ function RecoveryCard({
             title="Sleep performance — sufficiency + efficiency + restorative stages + consistency + stress."
           />
         </RingTile>
-        <RingTile>
-          <RingGauge
-            label="HRV"
-            score={hrvScore}
-            band={hrvBand}
-            palette="hrv"
-            size={96}
-            subLabel={hrvSubLabel}
-            title={hrvTitle}
-          />
-        </RingTile>
+        {!hrvHidden && (
+          <RingTile editMode={editMode} onHide={onHideHrv} hideLabel="HRV">
+            <CategoryRingGauge
+              label="HRV"
+              band={hrvBand}
+              bandLabel={hrvBandLabel}
+              size={96}
+              subLabel={hrvSubLabel}
+              title={hrvTitle}
+            />
+          </RingTile>
+        )}
       </div>
 
       <BaselineDeltaList r={r} />
@@ -1195,10 +1328,40 @@ function RecoveryCard({
 }
 
 /** Bordered ring "card". The light border around each ring + caption
- *  visually pairs them so the caption is unambiguously about that ring. */
-function RingTile({ children }: { children: React.ReactNode }) {
+ *  visually pairs them so the caption is unambiguously about that ring.
+ *  When `editMode` + `onHide` are supplied, renders an iOS-style minus
+ *  badge so the user can hide this ring from the Now page (mirrors the
+ *  Section-level hide pattern). */
+function RingTile({
+  children,
+  editMode = false,
+  onHide,
+  hideLabel,
+}: {
+  children: React.ReactNode;
+  editMode?: boolean;
+  onHide?: () => void;
+  hideLabel?: string;
+}) {
   return (
-    <div className="rounded-xl border border-zinc-800/70 bg-zinc-950/30 p-2.5 flex justify-center">
+    <div
+      className={
+        "relative rounded-xl border bg-zinc-950/30 p-2.5 flex justify-center " +
+        (editMode && onHide
+          ? "border-zinc-700 ring-1 ring-zinc-700/60"
+          : "border-zinc-800/70")
+      }
+    >
+      {editMode && onHide && (
+        <button
+          onClick={onHide}
+          className="absolute -top-2 -left-2 z-10 w-5 h-5 rounded-full bg-rose-500 text-white text-xs font-bold shadow-md flex items-center justify-center leading-none hover:bg-rose-600 transition-colors"
+          aria-label={`Hide ${hideLabel ?? "ring"}`}
+          title={`Hide ${hideLabel ?? "ring"}`}
+        >
+          −
+        </button>
+      )}
       {children}
     </div>
   );
@@ -1399,12 +1562,6 @@ function PresencePill({ seenAt }: { seenAt: string | null }) {
   );
 }
 
-type TempUnit = "C" | "F";
-
-function cToF(c: number): number {
-  return c * 9 / 5 + 32;
-}
-
 type SyncReport = {
   duration_secs: number;
   new_readings: number;
@@ -1421,6 +1578,253 @@ type BackendConfig = {
   allow_surplus_banking: boolean;
 };
 
+/** Severity bands for skin-temp deviation. Aligned with WHOOP's
+ *  "Health Monitor" pattern: yellow when deviation crosses the
+ *  noise-floor threshold (~±0.5°C), red when it crosses the more
+ *  alarming illness/fever threshold (~±1.0°C). Below 0.5°C the metric
+ *  is statistically uninteresting and we don't surface it anywhere. */
+function skinTempSeverity(
+  deviation_c: number,
+): "ok" | "elevated" | "alert" {
+  const abs = Math.abs(deviation_c);
+  if (abs > 1.0) return "alert";
+  if (abs > 0.5) return "elevated";
+  return "ok";
+}
+
+/** Compact chip for the sleep card. Renders only when the deviation
+ *  is interesting (≥0.5°C). Yellow at "elevated", rose at "alert". */
+function SkinTempHealthChip({ deviation_c }: { deviation_c: number }) {
+  const sev = skinTempSeverity(deviation_c);
+  if (sev === "ok") return null;
+
+  const cls =
+    sev === "alert"
+      ? "bg-rose-500/20 border-rose-500/40 text-rose-300"
+      : "bg-amber-500/20 border-amber-500/30 text-amber-300";
+  const label = sev === "alert" ? "Skin temp high" : "Skin temp elevated";
+  const sign = deviation_c >= 0 ? "+" : "";
+
+  return (
+    <span
+      className={`rounded-full border px-1.5 py-0.5 text-[9px] uppercase tracking-wider tabular-nums ${cls}`}
+      title={`${sev === "alert" ? "Significantly" : "Notably"} above your personal baseline. Often correlates with illness, stress, or alcohol — see how recovery shakes out tomorrow.`}
+    >
+      {label} · {sign}
+      {deviation_c.toFixed(1)}°C
+    </span>
+  );
+}
+
+/** Top-of-page banner. Only renders for "alert"-level deviations
+ *  (>1.0°C) — the kind worth interrupting your glance for. Below that
+ *  the chip on the sleep card is sufficient. */
+function SkinTempHealthBanner({
+  deviation_c,
+}: {
+  deviation_c: number | null | undefined;
+}) {
+  if (deviation_c == null) return null;
+  if (skinTempSeverity(deviation_c) !== "alert") return null;
+  const sign = deviation_c >= 0 ? "+" : "";
+  return (
+    <div
+      className="rounded-lg border border-rose-500/40 bg-rose-500/15 px-3 py-2 flex items-center gap-2 text-[11px]"
+      role="status"
+    >
+      <span className="text-rose-300 text-base leading-none" aria-hidden>
+        ⚠
+      </span>
+      <div className="flex flex-col leading-snug">
+        <span className="text-rose-200 font-medium">
+          Skin temperature significantly above your baseline
+        </span>
+        <span className="text-rose-300/80 tabular-nums">
+          {sign}
+          {deviation_c.toFixed(1)}°C tonight · check the recovery card for
+          context
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** Minute-precision time picker pair for adjusting a sleep cycle's
+ *  effective bounds. Shows the underlying date alongside the HH:MM
+ *  input so the user can see if a 3am edit is actually crossing
+ *  midnight relative to the displayed start.
+ *
+ *  When `originalStart` is non-null (i.e. this cycle has already been
+ *  user-edited), the editor renders an "Edited" badge and a "Reset to
+ *  detected" button that clears the override. */
+export function SleepTimesEditor({
+  sleepId,
+  start,
+  end,
+  originalStart,
+  originalEnd,
+  onSaved,
+}: {
+  /** YYYY-MM-DD identifying the cycle. */
+  sleepId: string;
+  /** Current effective start (ISO datetime string). */
+  start: string;
+  /** Current effective end (ISO datetime string). */
+  end: string;
+  /** Detector's pre-override start, or null when never edited. */
+  originalStart: string | null;
+  /** Detector's pre-override end, or null when never edited. */
+  originalEnd: string | null;
+  /** Called after a successful save or reset so the parent can refetch. */
+  onSaved: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const isOverridden = originalStart != null && originalEnd != null;
+
+  // ISO seconds → "YYYY-MM-DDTHH:MM" (the format <input type="datetime-local">
+  // accepts) and inverse helpers. We strip seconds because the user picks
+  // minute-precision values; preserving seconds would falsely imply
+  // sub-minute granularity in the round-trip.
+  const toLocalInput = (iso: string) => {
+    const d = new Date(iso);
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return (
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}`
+    );
+  };
+
+  const [editStart, setEditStart] = useState(toLocalInput(start));
+  const [editEnd, setEditEnd] = useState(toLocalInput(end));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Re-sync inputs when the parent's start/end change (e.g. after a save
+  // refetch). Without this, the inputs would drift out of date.
+  useEffect(() => {
+    if (!open) {
+      setEditStart(toLocalInput(start));
+      setEditEnd(toLocalInput(end));
+    }
+  }, [start, end, open]);
+
+  const onSave = async () => {
+    setError(null);
+    if (editEnd <= editStart) {
+      setError("End must be after start.");
+      return;
+    }
+    setBusy(true);
+    try {
+      // Append :00 seconds so the backend's "%Y-%m-%dT%H:%M:%S" parser
+      // accepts the value without falling back to the no-seconds form.
+      await invoke("set_sleep_override", {
+        sleepId,
+        startIso: `${editStart}:00`,
+        endIso: `${editEnd}:00`,
+      });
+      setOpen(false);
+      onSaved();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onReset = async () => {
+    if (!isOverridden) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("clear_sleep_override", { sleepId });
+      setOpen(false);
+      onSaved();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="text-[10px] uppercase tracking-wider text-zinc-500 hover:text-zinc-300 transition-colors"
+        >
+          {open ? "Cancel" : "Edit times"}
+        </button>
+        {isOverridden && (
+          <span
+            className="rounded-full bg-amber-500/20 border border-amber-500/30 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-amber-300"
+            title={
+              originalStart && originalEnd
+                ? `Detected: ${new Date(originalStart).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} → ${new Date(originalEnd).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                : undefined
+            }
+          >
+            Edited
+          </span>
+        )}
+      </div>
+      {open && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 flex flex-col gap-2">
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+                Start
+              </span>
+              <input
+                type="datetime-local"
+                value={editStart}
+                onChange={(e) => setEditStart(e.target.value)}
+                className="rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-1.5 text-xs text-zinc-200 tabular-nums"
+                disabled={busy}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+                End
+              </span>
+              <input
+                type="datetime-local"
+                value={editEnd}
+                onChange={(e) => setEditEnd(e.target.value)}
+                className="rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-1.5 text-xs text-zinc-200 tabular-nums"
+                disabled={busy}
+              />
+            </label>
+          </div>
+          {error && (
+            <p className="text-[11px] text-rose-300">{error}</p>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            {isOverridden && (
+              <button
+                onClick={onReset}
+                disabled={busy}
+                className="text-[11px] text-zinc-400 hover:text-zinc-200 transition-colors disabled:opacity-50"
+                title="Restore the detector's original bounds"
+              >
+                Reset to detected
+              </button>
+            )}
+            <button
+              onClick={onSave}
+              disabled={busy}
+              className="rounded-md bg-rose-500/90 hover:bg-rose-500 active:bg-rose-600 px-3 py-1 text-xs font-medium text-white transition-colors disabled:opacity-50"
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [sleepSnapshot, setSleepSnapshot] = useState<SleepSnapshot | null>(null);
@@ -1434,9 +1838,6 @@ function App() {
   // against hangs that bypass the 15-minute hard timeout).
   const syncActivityAtRef = useRef<number>(Date.now());
   const [lastSync, setLastSync] = useState<SyncReport | null>(null);
-  const [tempUnit, setTempUnit] = useState<TempUnit>(() => {
-    return (localStorage.getItem("tempUnit") as TempUnit) || "C";
-  });
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem("theme") as Theme | null;
     return saved && THEME_OPTIONS.some((o) => o.value === saved)
@@ -1464,6 +1865,23 @@ function App() {
     setHiddenSections((prev) => (prev.includes(id) ? prev : [...prev, id]));
   const showSection = (id: SectionId) =>
     setHiddenSections((prev) => prev.filter((s) => s !== id));
+  const [hiddenRings, setHiddenRings] = useState<RingId[]>(() => {
+    try {
+      const raw = localStorage.getItem("hiddenRings");
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr)
+        ? arr.filter((s): s is RingId => s in RING_LABELS)
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const isRingHidden = (id: RingId) => hiddenRings.includes(id);
+  const hideRing = (id: RingId) =>
+    setHiddenRings((prev) => (prev.includes(id) ? prev : [...prev, id]));
+  const showRing = (id: RingId) =>
+    setHiddenRings((prev) => prev.filter((s) => s !== id));
   const [deviceName, setDeviceName] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [syncInterval, setSyncInterval] = useState<number>(0);
@@ -1527,6 +1945,10 @@ function App() {
   }, [hiddenSections]);
 
   useEffect(() => {
+    localStorage.setItem("hiddenRings", JSON.stringify(hiddenRings));
+  }, [hiddenRings]);
+
+  useEffect(() => {
     if (!showSettings) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setShowSettings(false);
@@ -1534,12 +1956,6 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [showSettings]);
-
-  const toggleTemp = () => {
-    const next: TempUnit = tempUnit === "C" ? "F" : "C";
-    setTempUnit(next);
-    localStorage.setItem("tempUnit", next);
-  };
 
   const saveDeviceName = async (name: string) => {
     setDeviceName(name);
@@ -1785,6 +2201,16 @@ function App() {
     }
   };
 
+  const onHardReset = async () => {
+    try {
+      await invoke("hard_reset");
+    } catch (e) {
+      // Best-effort: even if the backend call fails, still reload the UI.
+      console.warn("hard_reset failed:", e);
+    }
+    window.location.reload();
+  };
+
   const onToggleLiveStream = async () => {
     try {
       if (liveActive || liveStarting) {
@@ -2005,6 +2431,14 @@ function App() {
             aria-label={mode === "compact" ? "Expand view" : "Collapse view"}
           >
             {mode === "compact" ? "⤢" : "⤡"}
+          </button>
+          <button
+            onClick={onHardReset}
+            className="rounded-md border border-zinc-800 hover:border-zinc-700 px-2 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
+            title="Hard reset — clears stuck sync state and reloads the app"
+            aria-label="Hard reset"
+          >
+            ↻
           </button>
           <button
             onClick={() => setShowSettings((v) => !v)}
@@ -2394,6 +2828,13 @@ function App() {
             : "flex flex-col gap-6"
         }
       >
+      {sleepSnapshot?.skin_temp_deviation_c != null && (
+        <div className={mode === "expanded" ? "col-span-2" : ""}>
+          <SkinTempHealthBanner
+            deviation_c={sleepSnapshot.skin_temp_deviation_c}
+          />
+        </div>
+      )}
       {!isSectionHidden("recovery") && (
       <Section
         title="Recovery"
@@ -2405,6 +2846,9 @@ function App() {
           <RecoveryCard
             r={r}
             sleepPerformance={sleepSnapshot?.performance_score ?? null}
+            hrvHidden={isRingHidden("hrv")}
+            editMode={editMode}
+            onHideHrv={() => hideRing("hrv")}
           />
         ) : (
           <p className="text-xs text-zinc-500">
@@ -2479,7 +2923,7 @@ function App() {
                 unit="bpm"
               />
             </div>
-            <div className="grid grid-cols-3 gap-4 pt-1">
+            <div className="grid grid-cols-2 gap-4 pt-1">
               <Stat
                 label="Stress"
                 value={
@@ -2491,19 +2935,6 @@ function App() {
                 value={
                   t.latest_spo2 != null ? `${Math.round(t.latest_spo2)}%` : "--"
                 }
-              />
-              <Stat
-                label={`Skin (°${tempUnit})`}
-                value={
-                  t.latest_skin_temp != null
-                    ? (tempUnit === "F"
-                        ? cToF(t.latest_skin_temp)
-                        : t.latest_skin_temp
-                      ).toFixed(1) + "°"
-                    : "--"
-                }
-                onClick={toggleTemp}
-                hint="click to toggle"
               />
             </div>
             <div className="pt-2">
@@ -2555,6 +2986,16 @@ function App() {
                 {formatTime(s.start)} → {formatTime(s.end)}
               </span>
             </div>
+            {sleepSnapshot && (
+              <SleepTimesEditor
+                sleepId={sleepSnapshot.sleep_id}
+                start={sleepSnapshot.sleep_start}
+                end={sleepSnapshot.sleep_end}
+                originalStart={sleepSnapshot.original_start}
+                originalEnd={sleepSnapshot.original_end}
+                onSaved={refresh}
+              />
+            )}
             {sleepSnapshot && sleepSnapshot.hypnogram.length > 0 && (
               <>
                 <SleepStoryLine snapshot={sleepSnapshot} />
@@ -2701,24 +3142,9 @@ function App() {
                     </span>
                   )}
                   {sleepSnapshot.skin_temp_deviation_c != null && (
-                    <span
-                      className={
-                        Math.abs(sleepSnapshot.skin_temp_deviation_c) > 0.5
-                          ? "text-amber-400"
-                          : undefined
-                      }
-                      title={
-                        Math.abs(sleepSnapshot.skin_temp_deviation_c) > 0.5
-                          ? "Notable deviation from baseline"
-                          : undefined
-                      }
-                    >
-                      Skin temp Δ{" "}
-                      <span className="text-zinc-200">
-                        {sleepSnapshot.skin_temp_deviation_c >= 0 ? "+" : ""}
-                        {sleepSnapshot.skin_temp_deviation_c.toFixed(2)}°C
-                      </span>
-                    </span>
+                    <SkinTempHealthChip
+                      deviation_c={sleepSnapshot.skin_temp_deviation_c}
+                    />
                   )}
                 </div>
               )}
@@ -2813,7 +3239,7 @@ function App() {
       )}
 
       {editMode && (
-        hiddenSections.length > 0 ? (
+        hiddenSections.length + hiddenRings.length > 0 ? (
           <div
             className={
               "rounded-xl border border-dashed border-zinc-700/60 bg-zinc-950/40 p-3 mt-2 flex flex-col gap-2 " +
@@ -2826,7 +3252,7 @@ function App() {
             <div className="flex flex-wrap gap-2">
               {hiddenSections.map((id) => (
                 <button
-                  key={id}
+                  key={`section-${id}`}
                   onClick={() => showSection(id)}
                   className="flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-900/60 px-3 py-1.5 text-xs text-zinc-200 hover:border-emerald-500/50 hover:bg-zinc-900 transition-colors"
                   title={`Add ${SECTION_LABELS[id]} back to the Now page`}
@@ -2835,6 +3261,19 @@ function App() {
                     +
                   </span>
                   {SECTION_LABELS[id]}
+                </button>
+              ))}
+              {hiddenRings.map((id) => (
+                <button
+                  key={`ring-${id}`}
+                  onClick={() => showRing(id)}
+                  className="flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-900/60 px-3 py-1.5 text-xs text-zinc-200 hover:border-emerald-500/50 hover:bg-zinc-900 transition-colors"
+                  title={`Add ${RING_LABELS[id]} ring back to the Recovery card`}
+                >
+                  <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-emerald-500 text-white text-xs font-bold leading-none">
+                    +
+                  </span>
+                  {RING_LABELS[id]} ring
                 </button>
               ))}
             </div>
@@ -2860,6 +3299,18 @@ function App() {
           hypnogram={zoomedHypnogram.hypnogram}
           cycleCount={zoomedHypnogram.cycleCount}
           onClose={() => setZoomedHypnogram(null)}
+          footer={
+            sleepSnapshot ? (
+              <SleepTimesEditor
+                sleepId={sleepSnapshot.sleep_id}
+                start={sleepSnapshot.sleep_start}
+                end={sleepSnapshot.sleep_end}
+                originalStart={sleepSnapshot.original_start}
+                originalEnd={sleepSnapshot.original_end}
+                onSaved={refresh}
+              />
+            ) : undefined
+          }
         />
       )}
     </main>
